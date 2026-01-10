@@ -6,14 +6,20 @@
                 "description": "Voer uw verbindingsgegevens in.",
                 "data": {
                     "connection_string": "IP-adres:Poort of Serieel apparaat",
-                    "has_feedback_module": "Feedbackmodule geïnstalleerd en verbonden via PC-Link?"
+                    "has_feedback_module": "Feedbackmodule geïnstalleerd en verbonden via PC-Link?",
+                    "disable_discovery": "Automatische ontdekking uitschakelen",
+                    "prior_gen3": "Installatie vóór Gen3?"
                 }
             },
-            "options": {
-                "title": "Nikobus",
-                "description": "Stel uw verversingsinterval in",
+            "reconfigure": {
+                "title": "Nikobus opnieuw configureren",
+                "description": "Werk uw Nikobus-instellingen bij",
                 "data": {
-                    "refresh_interval": "Verversingsinterval in seconden (60-3600)"
+                    "connection_string": "IP-adres:Poort of Serieel apparaat",
+                    "has_feedback_module": "Feedbackmodule geïnstalleerd?",
+                    "refresh_interval": "Verversingsinterval (seconden)",
+                    "prior_gen3": "Installatie vóór Gen3?",
+                    "disable_discovery": "Automatische ontdekking uitschakelen"
                 }
             }
         },
@@ -27,17 +33,5 @@
             "device_not_found_or_no_access": "Serieel apparaat niet gevonden of geen toegang."
         }
     },
-    "options": {
-        "step": {
-            "config": {
-                "title": "Nikobus",
-                "description": "Configuratie bijwerken",
-                "data": {
-                    "connection_string": "IP-adres:Poort of Serieel apparaat",
-                    "has_feedback_module": "Feedbackmodule geïnstalleerd en verbonden via PC-Link?",
-                    "refresh_interval": "Verversingsinterval in seconden (60-3600)"
-                }
-            }
-        }
-    }
+    "options": {}
 }

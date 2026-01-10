@@ -11,7 +11,7 @@ from typing import Dict, Optional, Tuple
 from homeassistant.core import HomeAssistant
 from custom_components.nikobus.exceptions import NikobusTimeoutError
 
-from .const import BUTTON_TIMER_THRESHOLDS, DIMMER_DELAY, REFRESH_DELAY, SHORT_PRESS
+from .const import BUTTON_TIMER_THRESHOLDS, DIMMER_DELAY, REFRESH_DELAY, SHORT_PRESS, CONF_DISABLE_DISCOVERY
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -50,6 +50,13 @@ class NikobusActuator:
         self._dict_button_data = dict_button_data
         self._dict_module_data = dict_module_data
         self._debounce_time_ms = 150
+        
+        # Load disable_discovery from options (preferred) or data (fallback)
+        self._disable_discovery = coordinator.config_entry.options.get(
+            CONF_DISABLE_DISCOVERY,
+            coordinator.config_entry.data.get(CONF_DISABLE_DISCOVERY, False)
+        )
+        
         self._press_states: Dict[str, PressState] = {}
         self._last_press_context: Dict[str, Dict[str, Optional[float | str | int]]] = {}
 
@@ -301,6 +308,10 @@ class NikobusActuator:
         self, address: str, press_context: Optional[Dict[str, Optional[float | str | int]]] = None
     ) -> None:
         """Discover a button and process it if configured."""
+        if self._disable_discovery:
+            _LOGGER.debug("Discovery disabled. Ignoring button %s", address)
+            return
+
         _LOGGER.debug("Discovering button at address: %s", address)
         button_data = self._dict_button_data.get("nikobus_button", {}).get(address)
 

@@ -19,6 +19,7 @@ from .const import (
     CONF_REFRESH_INTERVAL,
     CONF_HAS_FEEDBACK_MODULE,
     CONF_PRIOR_GEN3,
+    CONF_DISABLE_DISCOVERY,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -50,6 +51,10 @@ def _build_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
             vol.Optional(
                 CONF_PRIOR_GEN3,
                 default=defaults.get(CONF_PRIOR_GEN3, False),
+            ): bool,
+            vol.Optional(
+                CONF_DISABLE_DISCOVERY,
+                default=defaults.get(CONF_DISABLE_DISCOVERY, False),
             ): bool,
         }
     )
@@ -179,6 +184,10 @@ class NikobusConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         CONF_PRIOR_GEN3: user_input.get(
                             CONF_PRIOR_GEN3,
                             existing_entry.data.get(CONF_PRIOR_GEN3, False),
+                        ),
+                        CONF_DISABLE_DISCOVERY: user_input.get(
+                            CONF_DISABLE_DISCOVERY,
+                            existing_entry.data.get(CONF_DISABLE_DISCOVERY, False),
                         ),
                     },
                 )

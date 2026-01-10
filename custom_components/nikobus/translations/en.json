@@ -6,14 +6,20 @@
                 "description": "Please enter your connectivity details.",
                 "data": {
                     "connection_string": "IP address:Port or Serial device",
-                    "has_feedback_module": "Feedback Module installed and connected over PC-Link ?"
+                    "has_feedback_module": "Feedback Module installed and connected over PC-Link ?",
+                    "disable_discovery": "Disable Automatic Discovery",
+                    "prior_gen3": "Installation prior to Gen3?"
                 }
             },
-            "options": {
-                "title": "Nikobus",
-                "description": "Set your refresh interval",
+            "reconfigure": {
+                "title": "Reconfigure Nikobus",
+                "description": "Update your Nikobus settings",
                 "data": {
-                    "refresh_interval": "Refresh interval in seconds (60-3600)"
+                    "connection_string": "IP address:Port or Serial device",
+                    "has_feedback_module": "Feedback Module installed?",
+                    "refresh_interval": "Refresh interval (seconds)",
+                    "prior_gen3": "Installation prior to Gen3?",
+                    "disable_discovery": "Disable Automatic Discovery"
                 }
             }
         },
@@ -27,17 +33,5 @@
             "device_not_found_or_no_access": "Serial device not found or no access."
         }
     },
-    "options": {
-        "step": {
-            "config": {
-                "title": "Nikobus",
-                "description": "Update configuration",
-                "data": {
-                    "connection_string": "IP address:Port or Serial device",
-                    "has_feedback_module": "Feedback Module installed and connected over PC-Link ?",
-                    "refresh_interval": "Refresh interval in seconds (60-3600)"
-                }
-            }
-        }
-    }
+    "options": {}
 }
