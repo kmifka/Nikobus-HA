@@ -9,6 +9,7 @@ from typing import Any, Callable, Awaitable
 from .nkbprotocol import make_pc_link_command, calculate_group_number
 from .const import (
     COMMAND_EXECUTION_DELAY,
+    COMMAND_REPEAT_BURST_DELAY,
     COMMAND_ACK_WAIT_TIMEOUT,
     COMMAND_ANSWER_WAIT_TIMEOUT,
     MAX_ATTEMPTS,
@@ -73,6 +74,7 @@ class NikobusCommandHandler:
             try:
                 command_item = await self._command_queue.get()
                 command = command_item["command"]
+                batch = command_item.get("batch")
                 address = command_item.get("address")
                 future: asyncio.Future | None = command_item.get("future")
                 completion_handler: Callable[[], Awaitable[None]] | None = (
@@ -85,7 +87,15 @@ class NikobusCommandHandler:
                 )
 
                 try:
-                    if not address:
+                    if batch:
+                        for idx, batch_command in enumerate(batch):
+                            await self.send_command(batch_command)
+                            if idx < len(batch) - 1:
+                                await asyncio.sleep(COMMAND_REPEAT_BURST_DELAY)
+                        if completion_handler and callable(completion_handler):
+                            _LOGGER.debug("Calling completion handler for command batch")
+                            await completion_handler()
+                    elif not address:
                         await self.send_command(command)
                         if completion_handler and callable(completion_handler):
                             _LOGGER.debug("Calling completion handler for command without address")
@@ -286,6 +296,23 @@ class NikobusCommandHandler:
         }
         await self._command_queue.put(command_item)
         _LOGGER.debug("Command queued: %s", command)
+
+    async def queue_command_batch(
+        self,
+        commands: list[str],
+        completion_handler: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
+        """Queue a batch of commands to be executed back-to-back."""
+        if not commands:
+            return
+        _LOGGER.debug("Queueing command batch: %s", commands)
+        command_item = {
+            "command": commands[0],
+            "batch": commands,
+            "completion_handler": completion_handler,
+        }
+        await self._command_queue.put(command_item)
+        _LOGGER.debug("Command batch queued: %d commands", len(commands))
 
     async def send_command(self, command: str) -> None:
         """Send a command to the Nikobus system."""

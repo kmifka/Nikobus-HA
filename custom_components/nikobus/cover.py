@@ -801,6 +801,13 @@ class NikobusYamlCoverEntity(CoverEntity, RestoreEntity):
         position = None
         if last_state:
             position = last_state.attributes.get(ATTR_POSITION)
+            if position is None:
+                position = last_state.attributes.get("current_position")
+            if position is None:
+                if last_state.state == "open":
+                    position = 100
+                elif last_state.state == "closed":
+                    position = 0
 
         if position is None:
             position = self._tc.position_closed
@@ -849,7 +856,12 @@ class NikobusYamlCoverEntity(CoverEntity, RestoreEntity):
         return False
 
     async def async_open_cover(self, **kwargs: Any) -> None:
-        await self._send_command(self._up_code)
+        sent = await self._send_command(
+            self._up_code, wait_for_completion=True, retries=1
+        )
+        if not sent:
+            _LOGGER.warning("Open command failed for %s", self._attr_name)
+            return
         if self._tc:
             self._is_manual_position = False
             self._tc.start_travel_up()
@@ -858,7 +870,12 @@ class NikobusYamlCoverEntity(CoverEntity, RestoreEntity):
         self.async_write_ha_state()
 
     async def async_close_cover(self, **kwargs: Any) -> None:
-        await self._send_command(self._down_code)
+        sent = await self._send_command(
+            self._down_code, wait_for_completion=True, retries=1
+        )
+        if not sent:
+            _LOGGER.warning("Close command failed for %s", self._attr_name)
+            return
         if self._tc:
             self._is_manual_position = False
             self._tc.start_travel_down()
@@ -867,7 +884,10 @@ class NikobusYamlCoverEntity(CoverEntity, RestoreEntity):
         self.async_write_ha_state()
 
     async def async_stop_cover(self, **kwargs: Any) -> None:
-        await self._send_command(self._stop_code)
+        sent = await self._send_command(self._stop_code, wait_for_completion=True)
+        if not sent:
+            _LOGGER.warning("Stop command failed for %s", self._attr_name)
+            return
         if self._tc and self._tc.is_traveling():
             self._tc.stop()
         self._stop_auto_updater()
@@ -885,18 +905,37 @@ class NikobusYamlCoverEntity(CoverEntity, RestoreEntity):
         if current_position is None:
             current_position = self._tc.position_closed
 
+        sent = True
         if position < current_position and self._tc.travel_direction != TravelStatus.DIRECTION_DOWN:
-            await self._send_command(self._down_code)
+            sent = await self._send_command(
+                self._down_code, wait_for_completion=True, retries=1
+            )
+            if not sent:
+                _LOGGER.warning("Position command failed for %s", self._attr_name)
+                return
         elif position > current_position and self._tc.travel_direction != TravelStatus.DIRECTION_UP:
-            await self._send_command(self._up_code)
+            sent = await self._send_command(
+                self._up_code, wait_for_completion=True, retries=1
+            )
+            if not sent:
+                _LOGGER.warning("Position command failed for %s", self._attr_name)
+                return
 
         self._is_manual_position = position not in (0, 100)
         self._tc.start_travel(int(position))
         self._start_auto_updater()
 
-    async def _send_command(self, code: str) -> None:
+    async def _send_command(
+        self, code: str, wait_for_completion: bool = False, retries: int = 0
+    ) -> bool:
         command = f"#N{code}\r#E1"
-        await send_repeated_command(self._coordinator, command)
+        return await send_repeated_command(
+            self._coordinator,
+            command,
+            wait_for_completion=wait_for_completion,
+            retries=retries,
+            use_burst_queue=True,
+        )
 
     async def async_will_remove_from_hass(self) -> None:
         self._stop_auto_updater()
@@ -919,13 +958,22 @@ class NikobusYamlCoverEntity(CoverEntity, RestoreEntity):
         if self._stop_in_progress:
             return
 
+        # Persist intermediate position updates for reliable restore after restart.
+        self.async_write_ha_state()
+
         if self._tc.position_reached():
             self._stop_in_progress = True
             target = self._tc.current_position()
             if target not in (0, 100):
-                await self._send_command(self._stop_code)
+                sent = await self._send_command(
+                    self._stop_code, wait_for_completion=True, retries=1
+                )
+                if not sent:
+                    self._stop_in_progress = False
+                    return
             self._tc.stop()
             self._stop_auto_updater()
+            self.async_write_ha_state()
             self._stop_in_progress = False
 
         self.async_write_ha_state()

@@ -311,4 +311,8 @@ class NikobusYamlCoverSwitchEntity(SwitchEntity):
 
     async def _send_command(self, code: str) -> None:
         command = f"#N{code}\r#E1"
-        await send_repeated_command(self.coordinator, command)
+        await send_repeated_command(
+            self.coordinator,
+            command,
+            use_burst_queue=True,
+        )
