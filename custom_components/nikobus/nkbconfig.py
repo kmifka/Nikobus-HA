@@ -37,6 +37,8 @@ class NikobusConfig:
 
         except FileNotFoundError:
             self._handle_file_not_found(file_path, data_type)
+            data = self._empty_data_for_type(data_type)
+            return self._transform_loaded_data(data, data_type)
 
         except json.JSONDecodeError as err:
             _LOGGER.error(
@@ -78,15 +80,25 @@ class NikobusConfig:
 
     def _handle_file_not_found(self, file_path: str, data_type: str) -> None:
         """Handle the case where the configuration file is not found."""
+        _LOGGER.info(
+            "%s configuration file not found: %s. Treating as empty; file will be created on first write.",
+            data_type.capitalize(),
+            file_path,
+        )
+
+    def _empty_data_for_type(self, data_type: str) -> dict:
+        """Return an empty data structure for a given data type."""
         if data_type == "button":
-            _LOGGER.info(
-                "Button configuration file not found: %s. A new file will be created upon discovering the first button.",
-                file_path,
-            )
-        else:
-            raise NikobusDataError(
-                f"{data_type.capitalize()} configuration file not found: {file_path}"
-            )
+            return {"nikobus_button": []}
+        if data_type == "module":
+            return {
+                "switch_module": [],
+                "dimmer_module": [],
+                "roller_module": [],
+            }
+        if data_type == "scene":
+            return {"scene": []}
+        return {}
 
     async def write_json_data(self, file_name: str, data_type: str, data: dict) -> None:
         """Write data to a JSON file, transforming it into a list format if necessary."""
