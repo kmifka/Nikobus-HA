@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import hashlib
 from typing import Final
 
 import voluptuous as vol
@@ -21,7 +22,21 @@ from homeassistant.components import (
 from .nkbconnect import NikobusConnect
 from .exceptions import NikobusConnectionError
 
-from .const import DOMAIN, CONF_CONNECTION_STRING
+from homeassistant.util import slugify
+
+from .const import (
+    DOMAIN,
+    CONF_CONNECTION_STRING,
+    CONF_COVERS,
+    CONF_COVER_NAME,
+    CONF_COVER_UP_CODE,
+    CONF_COVER_DOWN_CODE,
+    CONF_COVER_STOP_CODE,
+    CONF_TRAVEL_UP_TIME,
+    CONF_TRAVEL_DOWN_TIME,
+    CONF_COVER_SIGNAL_REPEAT,
+    CONF_COVER_AS_SWITCH,
+)
 from .coordinator import NikobusDataCoordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -37,6 +52,87 @@ PLATFORMS: Final[list[str]] = [
 
 SCAN_MODULE_SCHEMA = vol.Schema({vol.Optional("module_address", default=""): cv.string})
 HUB_IDENTIFIER: Final[str] = "nikobus_hub"
+
+_CODE_REGEX = r"^[0-9A-Fa-f]{6}$"
+
+COVER_SCHEMA = vol.Schema(
+    {
+        vol.Required(CONF_COVER_NAME): cv.string,
+        vol.Required(CONF_COVER_UP_CODE): vol.Match(_CODE_REGEX),
+        vol.Required(CONF_COVER_DOWN_CODE): vol.Match(_CODE_REGEX),
+        vol.Required(CONF_COVER_STOP_CODE): vol.Match(_CODE_REGEX),
+        vol.Optional(CONF_TRAVEL_UP_TIME): vol.Coerce(float),
+        vol.Optional(CONF_TRAVEL_DOWN_TIME): vol.Coerce(float),
+        vol.Optional(CONF_COVER_AS_SWITCH): vol.In(["up", "down"]),
+    }
+)
+
+CONFIG_SCHEMA = vol.Schema(
+    {
+        DOMAIN: vol.Schema(
+            {
+                vol.Optional(CONF_COVERS): vol.All(cv.ensure_list, [COVER_SCHEMA]),
+                vol.Optional(CONF_COVER_SIGNAL_REPEAT, default=1): cv.positive_int,
+            }
+        )
+    },
+    extra=vol.ALLOW_EXTRA,
+)
+
+def _normalize_yaml_covers(raw_covers: list[dict]) -> list[dict]:
+    """Normalize YAML cover definitions and ensure stable unique IDs."""
+    normalized: list[dict] = []
+
+    for cover in raw_covers:
+        up_code = cover[CONF_COVER_UP_CODE].upper()
+        down_code = cover[CONF_COVER_DOWN_CODE].upper()
+        stop_code = cover[CONF_COVER_STOP_CODE].upper()
+        digest = hashlib.sha1(
+            ":".join(sorted([up_code, down_code, stop_code])).encode("utf-8")
+        ).hexdigest()[:12]
+        unique_id = f"{DOMAIN}_yaml_cover_{digest}"
+
+        raw_up_time = cover.get(CONF_TRAVEL_UP_TIME)
+        raw_down_time = cover.get(CONF_TRAVEL_DOWN_TIME)
+        if raw_up_time is None or raw_down_time is None:
+            travel_up_time = None
+            travel_down_time = None
+        else:
+            travel_up_time = float(raw_up_time)
+            travel_down_time = float(raw_down_time)
+
+        normalized.append(
+            {
+                CONF_COVER_NAME: cover[CONF_COVER_NAME],
+                CONF_COVER_UP_CODE: up_code,
+                CONF_COVER_DOWN_CODE: down_code,
+                CONF_COVER_STOP_CODE: stop_code,
+                CONF_TRAVEL_UP_TIME: travel_up_time,
+                CONF_TRAVEL_DOWN_TIME: travel_down_time,
+                CONF_COVER_AS_SWITCH: cover.get(CONF_COVER_AS_SWITCH),
+                "unique_id": unique_id,
+            }
+        )
+
+    return normalized
+
+
+async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+    """Set up the Nikobus component from YAML."""
+    if DOMAIN not in config:
+        return True
+
+    hass.data.setdefault(DOMAIN, {})
+
+    raw_covers = config[DOMAIN].get(CONF_COVERS)
+    if raw_covers:
+        hass.data[DOMAIN][CONF_COVERS] = _normalize_yaml_covers(raw_covers)
+
+    hass.data[DOMAIN][CONF_COVER_SIGNAL_REPEAT] = config[DOMAIN].get(
+        CONF_COVER_SIGNAL_REPEAT, 1
+    )
+
+    return True
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

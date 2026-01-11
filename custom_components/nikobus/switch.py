@@ -11,7 +11,17 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers import device_registry as dr
 
-from .const import DOMAIN, BRAND
+from .const import (
+    DOMAIN,
+    BRAND,
+    CONF_COVERS,
+    CONF_COVER_AS_SWITCH,
+    CONF_COVER_NAME,
+    CONF_COVER_UP_CODE,
+    CONF_COVER_DOWN_CODE,
+    CONF_COVER_STOP_CODE,
+    CONF_COVER_SIGNAL_REPEAT,
+)
 from .coordinator import NikobusDataCoordinator
 from .entity import NikobusEntity
 from .exceptions import NikobusError
@@ -77,6 +87,18 @@ async def async_setup_entry(
                 module_model=switch_data["module_model"],
             )
         )
+
+    # Process YAML-defined covers configured as switches
+    yaml_covers = hass.data.get(DOMAIN, {}).get(CONF_COVERS, [])
+    for cover_config in yaml_covers:
+        direction = cover_config.get(CONF_COVER_AS_SWITCH)
+        if direction in ("up", "down"):
+            entities.append(
+                NikobusYamlCoverSwitchEntity(
+                    coordinator=coordinator,
+                    config=cover_config,
+                )
+            )
 
     async_add_entities(entities)
     _LOGGER.debug("Added %d Nikobus switch entities.", len(entities))
@@ -233,3 +255,55 @@ class NikobusSwitchEntity(NikobusEntity, SwitchEntity):
                 err,
             )
             return False
+
+
+class NikobusYamlCoverSwitchEntity(SwitchEntity):
+    """Switch entity that triggers a YAML-defined cover direction."""
+
+    def __init__(self, coordinator: NikobusDataCoordinator, config: dict[str, Any]) -> None:
+        self.coordinator = coordinator
+        self._name = config[CONF_COVER_NAME]
+        self._direction = config[CONF_COVER_AS_SWITCH]
+        self._up_code = config[CONF_COVER_UP_CODE]
+        self._down_code = config[CONF_COVER_DOWN_CODE]
+        self._stop_code = config[CONF_COVER_STOP_CODE]
+        self._unique_id = f"{config['unique_id']}_switch"
+        self._is_on = False
+
+        self._attr_name = f"{self._name} (Switch)"
+        self._attr_unique_id = self._unique_id
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, self._unique_id)},
+            "manufacturer": BRAND,
+            "name": self._name,
+            "via_device": (DOMAIN, HUB_IDENTIFIER),
+        }
+
+    @property
+    def is_on(self) -> bool:
+        return self._is_on
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        code = self._up_code if self._direction == "up" else self._down_code
+        await self._send_command(code)
+        self._is_on = True
+        self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        await self._send_command(self._stop_code)
+        self._is_on = False
+        self.async_write_ha_state()
+
+    async def _send_command(self, code: str) -> None:
+        command = f"#N{code}\r#E1"
+        repeat = (
+            self.coordinator.hass.data.get(DOMAIN, {})
+            .get(CONF_COVER_SIGNAL_REPEAT, 1)
+        )
+        try:
+            repeat_count = max(1, int(repeat))
+        except (TypeError, ValueError):
+            repeat_count = 1
+
+        for _ in range(repeat_count):
+            await self.coordinator.nikobus_command.queue_command(command)

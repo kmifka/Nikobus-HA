@@ -21,6 +21,7 @@ from .const import (
     CONF_REFRESH_INTERVAL,
     CONF_HAS_FEEDBACK_MODULE,
     CONF_PRIOR_GEN3,
+    CONF_COVERS,
     DOMAIN,
 )
 from .exceptions import NikobusConnectionError, NikobusDataError
@@ -558,5 +559,17 @@ class NikobusDataCoordinator(DataUpdateCoordinator):
             sid = scene.get("id")
             if sid:
                 known.add(f"{DOMAIN}_scene_{sid}")
+
+        # -----------------------
+        # 5) YAML-defined covers
+        # using: nikobus_yaml_cover_{name}
+        # -----------------------
+        yaml_covers = self.hass.data.get(DOMAIN, {}).get(CONF_COVERS, [])
+        for cover in yaml_covers:
+            unique_id = cover.get("unique_id")
+            if unique_id:
+                known.add(unique_id)
+                if cover.get("as_switch") in ("up", "down"):
+                    known.add(f"{unique_id}_switch")
 
         return known

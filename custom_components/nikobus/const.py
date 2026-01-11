@@ -18,6 +18,17 @@ CONF_HAS_PC_LINK: Final[str] = "has_pclink"
 CONF_PRIOR_GEN3: Final[str] = "prior_gen3"
 CONF_DISABLE_DISCOVERY: Final[str] = "disable_discovery"
 
+# YAML-defined covers
+CONF_COVERS: Final[str] = "covers"
+CONF_COVER_NAME: Final[str] = "name"
+CONF_COVER_UP_CODE: Final[str] = "up_code"
+CONF_COVER_DOWN_CODE: Final[str] = "down_code"
+CONF_COVER_STOP_CODE: Final[str] = "stop_code"
+CONF_TRAVEL_UP_TIME: Final[str] = "travel_up_time"
+CONF_TRAVEL_DOWN_TIME: Final[str] = "travel_down_time"
+CONF_COVER_SIGNAL_REPEAT: Final[str] = "cover_signal_repeat"
+CONF_COVER_AS_SWITCH: Final[str] = "as_switch"
+
 # =============================================================================
 # Serial Connection
 # =============================================================================

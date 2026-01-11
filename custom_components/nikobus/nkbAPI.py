@@ -2,6 +2,7 @@
 
 import logging
 from .exceptions import NikobusError
+from .const import DOMAIN, CONF_COVER_SIGNAL_REPEAT
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -26,6 +27,16 @@ class NikobusAPI:
                 "Channel %d not found for %s in module %s", channel, address, module_key
             )
             return None
+
+    def _get_cover_repeat_count(self) -> int:
+        repeat = (
+            self._coordinator.hass.data.get(DOMAIN, {})
+            .get(CONF_COVER_SIGNAL_REPEAT, 1)
+        )
+        try:
+            return max(1, int(repeat))
+        except (TypeError, ValueError):
+            return 1
 
     async def _queue_led_command(
         self,
@@ -161,20 +172,23 @@ class NikobusAPI:
             command = led_off
 
         try:
-            if command:
-                await self._queue_led_command(
-                    command,
-                    address,
-                    channel,
-                    f"STOP ({direction})",
-                    completion_handler,
-                )
-            else:
-                await self._coordinator.nikobus_command.set_output_state(
-                    address, channel, 0x00, completion_handler=completion_handler
-                )
+            repeat = self._get_cover_repeat_count()
+            for idx in range(repeat):
+                handler = completion_handler if idx == repeat - 1 else None
+                if command:
+                    await self._queue_led_command(
+                        command,
+                        address,
+                        channel,
+                        f"STOP ({direction})",
+                        handler,
+                    )
+                else:
+                    await self._coordinator.nikobus_command.set_output_state(
+                        address, channel, 0x00, completion_handler=handler
+                    )
 
-            self._coordinator.set_bytearray_state(address, channel, 0x00)
+                self._coordinator.set_bytearray_state(address, channel, 0x00)
         except NikobusError as e:
             _LOGGER.error(
                 "Failed to stop cover at %s, channel %d: %s", address, channel, e
@@ -189,9 +203,12 @@ class NikobusAPI:
         led_on = channel_data.get("led_on") if channel_data else None
 
         try:
-            await self._execute_command(
-                address, channel, led_on, 0x01, completion_handler
-            )
+            repeat = self._get_cover_repeat_count()
+            for idx in range(repeat):
+                handler = completion_handler if idx == repeat - 1 else None
+                await self._execute_command(
+                    address, channel, led_on, 0x01, handler
+                )
         except NikobusError as e:
             _LOGGER.error(
                 "Failed to open cover at %s, channel %d: %s", address, channel, e
@@ -206,9 +223,12 @@ class NikobusAPI:
         led_off = channel_data.get("led_off") if channel_data else None
 
         try:
-            await self._execute_command(
-                address, channel, led_off, 0x02, completion_handler
-            )
+            repeat = self._get_cover_repeat_count()
+            for idx in range(repeat):
+                handler = completion_handler if idx == repeat - 1 else None
+                await self._execute_command(
+                    address, channel, led_off, 0x02, handler
+                )
         except NikobusError as e:
             _LOGGER.error(
                 "Failed to close cover at %s, channel %d: %s", address, channel, e

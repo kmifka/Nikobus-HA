@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import logging
 import time
+from datetime import timedelta
 from typing import Any, Dict, Optional
 
 from homeassistant.components.cover import (
@@ -19,10 +20,24 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers.event import async_track_time_interval
 
-from .const import DOMAIN, BRAND
+from .const import (
+    DOMAIN,
+    BRAND,
+    CONF_COVERS,
+    CONF_COVER_NAME,
+    CONF_COVER_UP_CODE,
+    CONF_COVER_DOWN_CODE,
+    CONF_COVER_STOP_CODE,
+    CONF_TRAVEL_UP_TIME,
+    CONF_TRAVEL_DOWN_TIME,
+    CONF_COVER_SIGNAL_REPEAT,
+    CONF_COVER_AS_SWITCH,
+)
 from .coordinator import NikobusDataCoordinator
 from .entity import NikobusEntity
+from .helpers.travelcalculator import TravelCalculator, TravelStatus
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -226,6 +241,16 @@ async def async_setup_entry(
     async_add_entities(cover_entities)
     _LOGGER.debug("Added %d Nikobus cover entities.", len(cover_entities))
     hass.data.setdefault(DOMAIN, {})["switch_entities"] = switch_entities
+
+    yaml_covers = hass.data.get(DOMAIN, {}).get(CONF_COVERS, [])
+    if yaml_covers:
+        yaml_entities = [
+            NikobusYamlCoverEntity(coordinator=coordinator, config=cover_config)
+            for cover_config in yaml_covers
+            if not cover_config.get(CONF_COVER_AS_SWITCH)
+        ]
+        async_add_entities(yaml_entities)
+        _LOGGER.debug("Added %d YAML-defined Nikobus covers.", len(yaml_entities))
 
 
 def _register_nikobus_roller_device(
@@ -716,3 +741,180 @@ class NikobusCoverEntity(NikobusEntity, CoverEntity, RestoreEntity):
             await self._end_motion()
         finally:
             self._motion_task = None
+
+
+class NikobusYamlCoverEntity(CoverEntity, RestoreEntity):
+    """Cover entity controlled by raw Nikobus command codes from YAML."""
+
+    def __init__(
+        self,
+        coordinator: NikobusDataCoordinator,
+        config: dict[str, Any],
+    ) -> None:
+        self._coordinator = coordinator
+        self._name = config[CONF_COVER_NAME]
+        self._up_code = config[CONF_COVER_UP_CODE]
+        self._down_code = config[CONF_COVER_DOWN_CODE]
+        self._stop_code = config[CONF_COVER_STOP_CODE]
+        self._unique_id = config["unique_id"]
+
+        travel_up = config.get(CONF_TRAVEL_UP_TIME)
+        travel_down = config.get(CONF_TRAVEL_DOWN_TIME)
+        if travel_up is not None and travel_down is not None:
+            self._tc = TravelCalculator(
+                travel_time_down=float(travel_down),
+                travel_time_up=float(travel_up),
+            )
+        else:
+            self._tc = None
+        self._unsubscribe_auto_updater = None
+        self._is_manual_position = False
+        self._stop_in_progress = False
+        self._state: Optional[str] = None
+
+        self._attr_name = self._name
+        self._attr_unique_id = self._unique_id
+        self._attr_device_class = CoverDeviceClass.SHUTTER
+        self._attr_supported_features = (
+            CoverEntityFeature.OPEN
+            | CoverEntityFeature.CLOSE
+            | CoverEntityFeature.STOP
+        )
+        if self._tc:
+            self._attr_supported_features |= CoverEntityFeature.SET_POSITION
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, self._unique_id)},
+            "manufacturer": BRAND,
+            "name": self._name,
+            "via_device": (DOMAIN, HUB_IDENTIFIER),
+        }
+
+    async def async_added_to_hass(self) -> None:
+        """Restore last known position."""
+        last_state = await self.async_get_last_state()
+        if not self._tc:
+            return
+
+        position = None
+        if last_state:
+            position = last_state.attributes.get(ATTR_POSITION)
+
+        if position is None:
+            position = self._tc.position_closed
+        self._tc.set_position(int(position))
+
+    @property
+    def current_cover_position(self) -> Optional[int]:
+        if not self._tc:
+            return None
+        return self._tc.current_position()
+
+    @property
+    def is_opening(self) -> bool:
+        if self._tc:
+            return self._tc.is_traveling() and self._tc.travel_direction == TravelStatus.DIRECTION_UP
+        return self._state == "opening"
+
+    @property
+    def is_closing(self) -> bool:
+        if self._tc:
+            return self._tc.is_traveling() and self._tc.travel_direction == TravelStatus.DIRECTION_DOWN
+        return self._state == "closing"
+
+    @property
+    def is_closed(self) -> bool:
+        if self._tc:
+            return self._tc.is_closed()
+        return False
+
+    async def async_open_cover(self, **kwargs: Any) -> None:
+        await self._send_command(self._up_code)
+        if self._tc:
+            self._is_manual_position = False
+            self._tc.start_travel_up()
+            self._start_auto_updater()
+        self._state = "opening"
+        self.async_write_ha_state()
+
+    async def async_close_cover(self, **kwargs: Any) -> None:
+        await self._send_command(self._down_code)
+        if self._tc:
+            self._is_manual_position = False
+            self._tc.start_travel_down()
+            self._start_auto_updater()
+        self._state = "closing"
+        self.async_write_ha_state()
+
+    async def async_stop_cover(self, **kwargs: Any) -> None:
+        await self._send_command(self._stop_code)
+        if self._tc and self._tc.is_traveling():
+            self._tc.stop()
+        self._stop_auto_updater()
+        self._state = None
+        self.async_write_ha_state()
+
+    async def async_set_cover_position(self, **kwargs: Any) -> None:
+        if not self._tc:
+            return
+        position = kwargs.get(ATTR_POSITION)
+        if position is None:
+            return
+
+        current_position = self._tc.current_position()
+        if current_position is None:
+            current_position = self._tc.position_closed
+
+        if position < current_position and self._tc.travel_direction != TravelStatus.DIRECTION_DOWN:
+            await self._send_command(self._down_code)
+        elif position > current_position and self._tc.travel_direction != TravelStatus.DIRECTION_UP:
+            await self._send_command(self._up_code)
+
+        self._is_manual_position = position not in (0, 100)
+        self._tc.start_travel(int(position))
+        self._start_auto_updater()
+
+    async def _send_command(self, code: str) -> None:
+        command = f"#N{code}\r#E1"
+        repeat = (
+            self._coordinator.hass.data.get(DOMAIN, {})
+            .get(CONF_COVER_SIGNAL_REPEAT, 1)
+        )
+        try:
+            repeat_count = max(1, int(repeat))
+        except (TypeError, ValueError):
+            repeat_count = 1
+
+        for _ in range(repeat_count):
+            await self._coordinator.nikobus_command.queue_command(command)
+
+    async def async_will_remove_from_hass(self) -> None:
+        self._stop_auto_updater()
+
+    def _start_auto_updater(self) -> None:
+        if not self._unsubscribe_auto_updater:
+            self._unsubscribe_auto_updater = async_track_time_interval(
+                self.hass, self._auto_updater_hook, timedelta(seconds=0.5)
+            )
+
+    def _stop_auto_updater(self) -> None:
+        if self._unsubscribe_auto_updater:
+            self._unsubscribe_auto_updater()
+            self._unsubscribe_auto_updater = None
+
+    @callback
+    async def _auto_updater_hook(self, now) -> None:
+        if not self._tc:
+            return
+        if self._stop_in_progress:
+            return
+
+        if self._tc.position_reached():
+            self._stop_in_progress = True
+            target = self._tc.current_position()
+            if target not in (0, 100):
+                await self._send_command(self._stop_code)
+            self._tc.stop()
+            self._stop_auto_updater()
+            self._stop_in_progress = False
+
+        self.async_write_ha_state()

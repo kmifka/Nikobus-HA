@@ -221,6 +221,24 @@ After installation, an example file is available at `/config/custom_components/n
 - For buttons with feedback LEDs, set `led_on` and `led_off` addresses (case-sensitive, format like `8AA8FA`). Leave blank if unused.
 - For roller outputs, add `operation_time` (seconds to fully open/close) so the integration can simulate shutter positioning.
 - To expose a roller (cover) output as a standard switch, set `use_as_switch` to `true` for that channel; the integration will create a switch entity that opens on "on" and stops on "off".
+
+## YAML Cover Configuration
+You can define additional covers in `configuration.yaml` when you want full manual control over the Nikobus command codes. Each cover requires three command codes (`up_code`, `down_code`, `stop_code`, 6-hex like `8AA8FA`). Travel times in seconds are optional: if omitted, the cover exposes only up/down/stop without position estimation; if set, position estimation is enabled.
+
+```yaml
+nikobus:
+  cover_signal_repeat: 1
+  covers:
+    - name: "Living Room Shutter"
+      up_code: "8AA8FA"
+      down_code: "8AA8FB"
+      stop_code: "8AA8FC"
+      travel_up_time: 25
+      travel_down_time: 27
+      as_switch: "up"  # optional: create a switch (on=up/down, off=stop)
+```
+
+Restart Home Assistant after editing `configuration.yaml` to load the new covers.
 - Prefix an unused output description with `not_in_use` to skip creating entities for it.
 
 ### Switch Module Example
