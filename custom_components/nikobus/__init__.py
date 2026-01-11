@@ -86,7 +86,13 @@ def _normalize_yaml_covers(raw_covers: list[dict]) -> list[dict]:
     normalized: list[dict] = []
 
     area_counters: dict[str, int] = {}
+    area_totals: dict[str, int] = {}
     default_counter = 0
+
+    for cover in raw_covers:
+        area_name = cover.get(CONF_COVER_AREA)
+        if area_name:
+            area_totals[area_name] = area_totals.get(area_name, 0) + 1
 
     for cover in raw_covers:
         up_code = cover[CONF_COVER_UP_CODE].upper()
@@ -108,9 +114,12 @@ def _normalize_yaml_covers(raw_covers: list[dict]) -> list[dict]:
 
         if area_name:
             area_counters[area_name] = area_counters.get(area_name, 0) + 1
-            suggested_object_id = slugify(
-                f"{area_name} {area_counters[area_name]}"
-            )
+            if area_totals.get(area_name, 0) <= 1:
+                suggested_object_id = slugify(area_name)
+            else:
+                suggested_object_id = slugify(
+                    f"{area_name} {area_counters[area_name]}"
+                )
         else:
             suggested_object_id = slugify(name)
 
