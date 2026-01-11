@@ -10,16 +10,10 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import (
-    DOMAIN,
-    CONF_PRIOR_GEN3,
-    CONF_COVERS,
-    CONF_COVER_UP_CODE,
-    CONF_COVER_DOWN_CODE,
-    CONF_COVER_STOP_CODE,
-)
+from .const import DOMAIN, CONF_PRIOR_GEN3
 from .coordinator import NikobusDataCoordinator
 from .entity import NikobusEntity
+from .helpers.button_filter import get_excluded_button_addresses
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -32,7 +26,7 @@ async def async_setup_entry(
 
     coordinator: NikobusDataCoordinator = entry.runtime_data
     entities: list[NikobusButtonEntity] = []
-    excluded_addresses = _get_excluded_button_addresses(hass)
+    excluded_addresses = get_excluded_button_addresses(hass)
 
     if coordinator.dict_button_data:
         for button_data in coordinator.dict_button_data.get(
@@ -67,21 +61,6 @@ async def async_setup_entry(
 
     async_add_entities(entities)
     _LOGGER.debug("Added %d Nikobus button entities.", len(entities))
-
-
-def _get_excluded_button_addresses(hass: HomeAssistant) -> set[str]:
-    """Return addresses that should not create button/sensor entities."""
-    excluded: set[str] = set()
-    for cover in hass.data.get(DOMAIN, {}).get(CONF_COVERS, []):
-        for key in (
-            CONF_COVER_UP_CODE,
-            CONF_COVER_DOWN_CODE,
-            CONF_COVER_STOP_CODE,
-        ):
-            code = cover.get(key)
-            if code:
-                excluded.add(code.upper())
-    return excluded
 
 
 class NikobusButtonEntity(NikobusEntity, ButtonEntity):

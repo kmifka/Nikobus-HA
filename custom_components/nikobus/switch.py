@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import Any
 
@@ -11,7 +10,6 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers import device_registry as dr
-from homeassistant.helpers import area_registry as ar, entity_registry as er
 
 from .const import (
     DOMAIN,
@@ -22,12 +20,16 @@ from .const import (
     CONF_COVER_UP_CODE,
     CONF_COVER_DOWN_CODE,
     CONF_COVER_STOP_CODE,
-    CONF_COVER_SIGNAL_REPEAT,
     CONF_COVER_AREA,
 )
 from .coordinator import NikobusDataCoordinator
 from .entity import NikobusEntity
 from .exceptions import NikobusError
+from .helpers.command import send_repeated_command
+from .helpers.entity_registry import (
+    async_assign_area_if_missing,
+    async_apply_suggested_entity_id,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -279,20 +281,18 @@ class NikobusYamlCoverSwitchEntity(SwitchEntity):
         self._attr_suggested_object_id = config.get("suggested_object_id")
 
     async def async_added_to_hass(self) -> None:
-        if not self._area_name or not self.entity_id:
+        if not self.entity_id:
             return
-        area_reg = ar.async_get(self.hass)
-        ent_reg = er.async_get(self.hass)
-        area = area_reg.async_get_area_by_name(self._area_name)
-        if area is None:
-            area = area_reg.async_get_or_create(self._area_name)
-        for _ in range(5):
-            entry = ent_reg.async_get(self.entity_id)
-            if entry is not None:
-                if entry.area_id is None:
-                    ent_reg.async_update_entity(self.entity_id, area_id=area.id)
-                break
-            await asyncio.sleep(0.2)
+        await async_assign_area_if_missing(
+            self.hass, self.entity_id, self._area_name
+        )
+        await async_apply_suggested_entity_id(
+            self.hass,
+            self.entity_id,
+            "switch",
+            self._attr_name,
+            self._attr_suggested_object_id,
+        )
 
     @property
     def is_on(self) -> bool:
@@ -311,14 +311,4 @@ class NikobusYamlCoverSwitchEntity(SwitchEntity):
 
     async def _send_command(self, code: str) -> None:
         command = f"#N{code}\r#E1"
-        repeat = (
-            self.coordinator.hass.data.get(DOMAIN, {})
-            .get(CONF_COVER_SIGNAL_REPEAT, 1)
-        )
-        try:
-            repeat_count = max(1, int(repeat))
-        except (TypeError, ValueError):
-            repeat_count = 1
-
-        for _ in range(repeat_count):
-            await self.coordinator.nikobus_command.queue_command(command)
+        await send_repeated_command(self.coordinator, command)

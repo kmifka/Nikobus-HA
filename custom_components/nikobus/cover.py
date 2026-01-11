@@ -20,7 +20,6 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers import device_registry as dr
-from homeassistant.helpers import area_registry as ar, entity_registry as er
 from homeassistant.helpers.event import async_track_time_interval
 
 from .const import (
@@ -33,13 +32,17 @@ from .const import (
     CONF_COVER_STOP_CODE,
     CONF_TRAVEL_UP_TIME,
     CONF_TRAVEL_DOWN_TIME,
-    CONF_COVER_SIGNAL_REPEAT,
     CONF_COVER_AS_SWITCH,
     CONF_COVER_AREA,
 )
 from .coordinator import NikobusDataCoordinator
 from .entity import NikobusEntity
 from .helpers.travelcalculator import TravelCalculator, TravelStatus
+from .helpers.command import send_repeated_command
+from .helpers.entity_registry import (
+    async_assign_area_if_missing,
+    async_apply_suggested_entity_id,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -792,6 +795,7 @@ class NikobusYamlCoverEntity(CoverEntity, RestoreEntity):
         last_state = await self.async_get_last_state()
         if not self._tc:
             await self._assign_area()
+            await self._ensure_suggested_entity_id()
             return
 
         position = None
@@ -802,25 +806,23 @@ class NikobusYamlCoverEntity(CoverEntity, RestoreEntity):
             position = self._tc.position_closed
         self._tc.set_position(int(position))
         await self._assign_area()
+        await self._ensure_suggested_entity_id()
 
     async def _assign_area(self) -> None:
         """Assign entity to a Home Assistant area if configured."""
-        if not self._area_name or not self.entity_id:
-            return
-        area_reg = ar.async_get(self.hass)
-        ent_reg = er.async_get(self.hass)
-        area = area_reg.async_get_area_by_name(self._area_name)
-        if area is None:
-            area = area_reg.async_get_or_create(self._area_name)
+        await async_assign_area_if_missing(
+            self.hass, self.entity_id, self._area_name
+        )
 
-        # Retry a few times in case the entity registry entry isn't ready yet.
-        for _ in range(5):
-            entry = ent_reg.async_get(self.entity_id)
-            if entry is not None:
-                if entry.area_id is None:
-                    ent_reg.async_update_entity(self.entity_id, area_id=area.id)
-                break
-            await asyncio.sleep(0.2)
+    async def _ensure_suggested_entity_id(self) -> None:
+        """Apply suggested entity id for new entities without user overrides."""
+        await async_apply_suggested_entity_id(
+            self.hass,
+            self.entity_id,
+            "cover",
+            self._attr_name,
+            self._attr_suggested_object_id,
+        )
 
     @property
     def current_cover_position(self) -> Optional[int]:
@@ -894,17 +896,7 @@ class NikobusYamlCoverEntity(CoverEntity, RestoreEntity):
 
     async def _send_command(self, code: str) -> None:
         command = f"#N{code}\r#E1"
-        repeat = (
-            self._coordinator.hass.data.get(DOMAIN, {})
-            .get(CONF_COVER_SIGNAL_REPEAT, 1)
-        )
-        try:
-            repeat_count = max(1, int(repeat))
-        except (TypeError, ValueError):
-            repeat_count = 1
-
-        for _ in range(repeat_count):
-            await self._coordinator.nikobus_command.queue_command(command)
+        await send_repeated_command(self._coordinator, command)
 
     async def async_will_remove_from_hass(self) -> None:
         self._stop_auto_updater()
