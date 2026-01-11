@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -10,6 +11,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import area_registry as ar, entity_registry as er
 
 from .const import (
     DOMAIN,
@@ -21,6 +23,7 @@ from .const import (
     CONF_COVER_DOWN_CODE,
     CONF_COVER_STOP_CODE,
     CONF_COVER_SIGNAL_REPEAT,
+    CONF_COVER_AREA,
 )
 from .coordinator import NikobusDataCoordinator
 from .entity import NikobusEntity
@@ -269,15 +272,27 @@ class NikobusYamlCoverSwitchEntity(SwitchEntity):
         self._stop_code = config[CONF_COVER_STOP_CODE]
         self._unique_id = f"{config['unique_id']}_switch"
         self._is_on = False
+        self._area_name = config.get(CONF_COVER_AREA)
 
-        self._attr_name = f"{self._name} (Switch)"
+        self._attr_name = self._name
         self._attr_unique_id = self._unique_id
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, self._unique_id)},
-            "manufacturer": BRAND,
-            "name": self._name,
-            "via_device": (DOMAIN, HUB_IDENTIFIER),
-        }
+        self._attr_suggested_object_id = config.get("suggested_object_id")
+
+    async def async_added_to_hass(self) -> None:
+        if not self._area_name or not self.entity_id:
+            return
+        area_reg = ar.async_get(self.hass)
+        ent_reg = er.async_get(self.hass)
+        area = area_reg.async_get_area_by_name(self._area_name)
+        if area is None:
+            area = area_reg.async_get_or_create(self._area_name)
+        for _ in range(5):
+            entry = ent_reg.async_get(self.entity_id)
+            if entry is not None:
+                if entry.area_id is None:
+                    ent_reg.async_update_entity(self.entity_id, area_id=area.id)
+                break
+            await asyncio.sleep(0.2)
 
     @property
     def is_on(self) -> bool:

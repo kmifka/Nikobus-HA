@@ -20,6 +20,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import area_registry as ar, entity_registry as er
 from homeassistant.helpers.event import async_track_time_interval
 
 from .const import (
@@ -34,6 +35,7 @@ from .const import (
     CONF_TRAVEL_DOWN_TIME,
     CONF_COVER_SIGNAL_REPEAT,
     CONF_COVER_AS_SWITCH,
+    CONF_COVER_AREA,
 )
 from .coordinator import NikobusDataCoordinator
 from .entity import NikobusEntity
@@ -757,6 +759,7 @@ class NikobusYamlCoverEntity(CoverEntity, RestoreEntity):
         self._down_code = config[CONF_COVER_DOWN_CODE]
         self._stop_code = config[CONF_COVER_STOP_CODE]
         self._unique_id = config["unique_id"]
+        self._area_name = config.get(CONF_COVER_AREA)
 
         travel_up = config.get(CONF_TRAVEL_UP_TIME)
         travel_down = config.get(CONF_TRAVEL_DOWN_TIME)
@@ -774,6 +777,7 @@ class NikobusYamlCoverEntity(CoverEntity, RestoreEntity):
 
         self._attr_name = self._name
         self._attr_unique_id = self._unique_id
+        self._attr_suggested_object_id = config.get("suggested_object_id")
         self._attr_device_class = CoverDeviceClass.SHUTTER
         self._attr_supported_features = (
             CoverEntityFeature.OPEN
@@ -782,17 +786,12 @@ class NikobusYamlCoverEntity(CoverEntity, RestoreEntity):
         )
         if self._tc:
             self._attr_supported_features |= CoverEntityFeature.SET_POSITION
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, self._unique_id)},
-            "manufacturer": BRAND,
-            "name": self._name,
-            "via_device": (DOMAIN, HUB_IDENTIFIER),
-        }
 
     async def async_added_to_hass(self) -> None:
         """Restore last known position."""
         last_state = await self.async_get_last_state()
         if not self._tc:
+            await self._assign_area()
             return
 
         position = None
@@ -802,6 +801,26 @@ class NikobusYamlCoverEntity(CoverEntity, RestoreEntity):
         if position is None:
             position = self._tc.position_closed
         self._tc.set_position(int(position))
+        await self._assign_area()
+
+    async def _assign_area(self) -> None:
+        """Assign entity to a Home Assistant area if configured."""
+        if not self._area_name or not self.entity_id:
+            return
+        area_reg = ar.async_get(self.hass)
+        ent_reg = er.async_get(self.hass)
+        area = area_reg.async_get_area_by_name(self._area_name)
+        if area is None:
+            area = area_reg.async_get_or_create(self._area_name)
+
+        # Retry a few times in case the entity registry entry isn't ready yet.
+        for _ in range(5):
+            entry = ent_reg.async_get(self.entity_id)
+            if entry is not None:
+                if entry.area_id is None:
+                    ent_reg.async_update_entity(self.entity_id, area_id=area.id)
+                break
+            await asyncio.sleep(0.2)
 
     @property
     def current_cover_position(self) -> Optional[int]:

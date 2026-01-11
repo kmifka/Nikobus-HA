@@ -236,6 +236,7 @@ nikobus:
       travel_up_time: 25
       travel_down_time: 27
       as_switch: "up"  # optional: create a switch (on=up/down, off=stop)
+      area: "Living Room"  # optional: assign to HA area
 ```
 
 Restart Home Assistant after editing `configuration.yaml` to load the new covers.

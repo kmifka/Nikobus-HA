@@ -36,6 +36,7 @@ from .const import (
     CONF_TRAVEL_DOWN_TIME,
     CONF_COVER_SIGNAL_REPEAT,
     CONF_COVER_AS_SWITCH,
+    CONF_COVER_AREA,
 )
 from .coordinator import NikobusDataCoordinator
 
@@ -57,13 +58,14 @@ _CODE_REGEX = r"^[0-9A-Fa-f]{6}$"
 
 COVER_SCHEMA = vol.Schema(
     {
-        vol.Required(CONF_COVER_NAME): cv.string,
+        vol.Optional(CONF_COVER_NAME): cv.string,
         vol.Required(CONF_COVER_UP_CODE): vol.Match(_CODE_REGEX),
         vol.Required(CONF_COVER_DOWN_CODE): vol.Match(_CODE_REGEX),
         vol.Required(CONF_COVER_STOP_CODE): vol.Match(_CODE_REGEX),
         vol.Optional(CONF_TRAVEL_UP_TIME): vol.Coerce(float),
         vol.Optional(CONF_TRAVEL_DOWN_TIME): vol.Coerce(float),
         vol.Optional(CONF_COVER_AS_SWITCH): vol.In(["up", "down"]),
+        vol.Optional(CONF_COVER_AREA): cv.string,
     }
 )
 
@@ -83,6 +85,9 @@ def _normalize_yaml_covers(raw_covers: list[dict]) -> list[dict]:
     """Normalize YAML cover definitions and ensure stable unique IDs."""
     normalized: list[dict] = []
 
+    area_counters: dict[str, int] = {}
+    default_counter = 0
+
     for cover in raw_covers:
         up_code = cover[CONF_COVER_UP_CODE].upper()
         down_code = cover[CONF_COVER_DOWN_CODE].upper()
@@ -91,6 +96,23 @@ def _normalize_yaml_covers(raw_covers: list[dict]) -> list[dict]:
             ":".join(sorted([up_code, down_code, stop_code])).encode("utf-8")
         ).hexdigest()[:12]
         unique_id = f"{DOMAIN}_yaml_cover_{digest}"
+
+        area_name = cover.get(CONF_COVER_AREA)
+        raw_name = cover.get(CONF_COVER_NAME)
+
+        if raw_name:
+            name = raw_name
+        else:
+            default_counter += 1
+            name = f"Jalousie {default_counter}"
+
+        if area_name:
+            area_counters[area_name] = area_counters.get(area_name, 0) + 1
+            suggested_object_id = slugify(
+                f"{area_name} {area_counters[area_name]}"
+            )
+        else:
+            suggested_object_id = slugify(name)
 
         raw_up_time = cover.get(CONF_TRAVEL_UP_TIME)
         raw_down_time = cover.get(CONF_TRAVEL_DOWN_TIME)
@@ -103,13 +125,15 @@ def _normalize_yaml_covers(raw_covers: list[dict]) -> list[dict]:
 
         normalized.append(
             {
-                CONF_COVER_NAME: cover[CONF_COVER_NAME],
+                CONF_COVER_NAME: name,
                 CONF_COVER_UP_CODE: up_code,
                 CONF_COVER_DOWN_CODE: down_code,
                 CONF_COVER_STOP_CODE: stop_code,
                 CONF_TRAVEL_UP_TIME: travel_up_time,
                 CONF_TRAVEL_DOWN_TIME: travel_down_time,
                 CONF_COVER_AS_SWITCH: cover.get(CONF_COVER_AS_SWITCH),
+                CONF_COVER_AREA: area_name,
+                "suggested_object_id": suggested_object_id,
                 "unique_id": unique_id,
             }
         )

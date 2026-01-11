@@ -28,6 +28,7 @@ CONF_TRAVEL_UP_TIME: Final[str] = "travel_up_time"
 CONF_TRAVEL_DOWN_TIME: Final[str] = "travel_down_time"
 CONF_COVER_SIGNAL_REPEAT: Final[str] = "cover_signal_repeat"
 CONF_COVER_AS_SWITCH: Final[str] = "as_switch"
+CONF_COVER_AREA: Final[str] = "area"
 
 # =============================================================================
 # Serial Connection
