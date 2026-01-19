@@ -20,6 +20,7 @@ CONF_DISABLE_DISCOVERY: Final[str] = "disable_discovery"
 
 # YAML-defined covers
 CONF_COVERS: Final[str] = "covers"
+CONF_GROUP_COVERS: Final[str] = "group_covers"
 CONF_COVER_NAME: Final[str] = "name"
 CONF_COVER_UP_CODE: Final[str] = "up_code"
 CONF_COVER_DOWN_CODE: Final[str] = "down_code"

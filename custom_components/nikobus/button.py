@@ -184,3 +184,4 @@ class NikobusButtonEntity(NikobusEntity, ButtonEntity):
                 err,
                 exc_info=True,
             )
+

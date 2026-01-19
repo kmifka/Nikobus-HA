@@ -22,6 +22,7 @@ from .const import (
     CONF_HAS_FEEDBACK_MODULE,
     CONF_PRIOR_GEN3,
     CONF_COVERS,
+    CONF_GROUP_COVERS,
     DOMAIN,
 )
 from .exceptions import NikobusConnectionError, NikobusDataError
@@ -400,6 +401,7 @@ class NikobusDataCoordinator(DataUpdateCoordinator):
         )
         await self.nikobus_command.queue_command(f"#N{address}\r#E1")
 
+
     async def _handle_nikobus_refreshed(self, data) -> None:
         """Handle Nikobus refreshed events."""
         impacted_module_address = data.get("impacted_module_address")
@@ -571,5 +573,15 @@ class NikobusDataCoordinator(DataUpdateCoordinator):
                 known.add(unique_id)
                 if cover.get("as_switch") in ("up", "down"):
                     known.add(f"{unique_id}_switch")
+
+        # -----------------------
+        # 6) YAML-defined group covers
+        # using: nikobus_yaml_group_cover_{name}
+        # -----------------------
+        yaml_group_covers = self.hass.data.get(DOMAIN, {}).get(CONF_GROUP_COVERS, [])
+        for cover in yaml_group_covers:
+            unique_id = cover.get("unique_id")
+            if unique_id:
+                known.add(unique_id)
 
         return known

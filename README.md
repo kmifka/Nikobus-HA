@@ -237,6 +237,14 @@ nikobus:
       travel_down_time: 27
       as_switch: "up"  # optional: create a switch (on=up/down, off=stop)
       area: "Living Room"  # optional: assign to HA area
+  group_covers:
+    - name: "Kitchen Shutters - All"
+      up_code: "C86C4E"
+      down_code: "A1B2C3"
+      stop_code: "D4E5F6"
+      members:
+        - "cover.living_room_shutter"
+      area: "Kitchen"
 ```
 
 Restart Home Assistant after editing `configuration.yaml` to load the new covers.
@@ -354,6 +362,27 @@ If a button controls a shutter, set `operation_time` (in seconds) on the button 
   ]
 }
 ```
+
+### Group Covers (raw up/down/stop)
+
+You can define **group covers** in `configuration.yaml` that send raw up/down/stop codes to a Nikobus group command. These entities do **not** track their own position, but update the motion state of individual YAML covers.
+
+```yaml
+nikobus:
+  group_covers:
+    - name: "Kitchen Shutters - All"
+      up_code: "C86C4E"
+      down_code: "A1B2C3"
+      stop_code: "D4E5F6"
+      members:
+        - "Living Room Shutter"
+```
+
+- `members` is optional. If omitted or empty, all YAML covers are affected.
+- Members must be **HA entity_ids** (e.g. `cover.living_room_shutter`).
+- When a **physical button** is taught to these group codes, the integration mirrors standard shutter logic:
+  - repeated up/down while already moving stops
+  - long press (totmann) stops on release
 
 ## How the Integration Works
 

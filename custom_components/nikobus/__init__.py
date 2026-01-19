@@ -28,6 +28,7 @@ from .const import (
     DOMAIN,
     CONF_CONNECTION_STRING,
     CONF_COVERS,
+    CONF_GROUP_COVERS,
     CONF_COVER_NAME,
     CONF_COVER_UP_CODE,
     CONF_COVER_DOWN_CODE,
@@ -69,11 +70,25 @@ COVER_SCHEMA = vol.Schema(
     }
 )
 
+GROUP_COVER_SCHEMA = vol.Schema(
+    {
+        vol.Required(CONF_COVER_NAME): cv.string,
+        vol.Required(CONF_COVER_UP_CODE): vol.Match(_CODE_REGEX),
+        vol.Required(CONF_COVER_DOWN_CODE): vol.Match(_CODE_REGEX),
+        vol.Required(CONF_COVER_STOP_CODE): vol.Match(_CODE_REGEX),
+        vol.Optional("members"): vol.All(cv.ensure_list, [cv.string]),
+        vol.Optional(CONF_COVER_AREA): cv.string,
+    }
+)
+
 CONFIG_SCHEMA = vol.Schema(
     {
         DOMAIN: vol.Schema(
             {
                 vol.Optional(CONF_COVERS): vol.All(cv.ensure_list, [COVER_SCHEMA]),
+                vol.Optional(CONF_GROUP_COVERS): vol.All(
+                    cv.ensure_list, [GROUP_COVER_SCHEMA]
+                ),
                 vol.Optional(CONF_COVER_SIGNAL_REPEAT, default=1): cv.positive_int,
             }
         )
@@ -160,6 +175,32 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     raw_covers = config[DOMAIN].get(CONF_COVERS)
     if raw_covers:
         hass.data[DOMAIN][CONF_COVERS] = _normalize_yaml_covers(raw_covers)
+
+    raw_group_covers = config[DOMAIN].get(CONF_GROUP_COVERS)
+    if raw_group_covers:
+        normalized_group_covers = []
+        for cover in raw_group_covers:
+            name = cover[CONF_COVER_NAME]
+            up_code = cover[CONF_COVER_UP_CODE].upper()
+            down_code = cover[CONF_COVER_DOWN_CODE].upper()
+            stop_code = cover[CONF_COVER_STOP_CODE].upper()
+            digest = hashlib.sha1(
+                ":".join(sorted([name, up_code, down_code, stop_code])).encode("utf-8")
+            ).hexdigest()[:12]
+            unique_id = f"{DOMAIN}_yaml_group_cover_{digest}"
+            normalized_group_covers.append(
+                {
+                    CONF_COVER_NAME: name,
+                    CONF_COVER_UP_CODE: up_code,
+                    CONF_COVER_DOWN_CODE: down_code,
+                    CONF_COVER_STOP_CODE: stop_code,
+                    "members": cover.get("members", []),
+                    CONF_COVER_AREA: cover.get(CONF_COVER_AREA),
+                    "unique_id": unique_id,
+                    "suggested_object_id": slugify(name),
+                }
+            )
+        hass.data[DOMAIN][CONF_GROUP_COVERS] = normalized_group_covers
 
     hass.data[DOMAIN][CONF_COVER_SIGNAL_REPEAT] = config[DOMAIN].get(
         CONF_COVER_SIGNAL_REPEAT, 1

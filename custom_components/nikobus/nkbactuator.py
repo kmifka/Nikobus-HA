@@ -11,7 +11,19 @@ from typing import Dict, Optional, Tuple
 from homeassistant.core import HomeAssistant
 from custom_components.nikobus.exceptions import NikobusTimeoutError
 
-from .const import BUTTON_TIMER_THRESHOLDS, DIMMER_DELAY, REFRESH_DELAY, SHORT_PRESS, CONF_DISABLE_DISCOVERY
+from .const import (
+    BUTTON_TIMER_THRESHOLDS,
+    DIMMER_DELAY,
+    REFRESH_DELAY,
+    SHORT_PRESS,
+    LONG_PRESS,
+    CONF_DISABLE_DISCOVERY,
+    CONF_GROUP_COVERS,
+    CONF_COVER_UP_CODE,
+    CONF_COVER_DOWN_CODE,
+    CONF_COVER_STOP_CODE,
+    DOMAIN,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -96,6 +108,7 @@ class NikobusActuator:
             state_value="pressed",
             duration=None,
         )
+        self._handle_group_cover_press(normalized_address)
 
     def _start_timer_tasks(self, state: PressState) -> None:
         """Start timer tasks for press durations."""
@@ -192,6 +205,9 @@ class NikobusActuator:
             state_value="released",
             duration=press_duration,
         )
+
+        if press_duration >= LONG_PRESS:
+            self._handle_group_cover_release(state.address)
 
         bucket = press_context["bucket"]
         if bucket is not None:
@@ -503,3 +519,52 @@ class NikobusActuator:
             )
 
         self._coordinator.async_update_listeners()
+
+    def _handle_group_cover_press(self, address: str) -> None:
+        group_cover = self._get_group_cover_for_code(address)
+        if not group_cover:
+            return
+
+        members = group_cover.get("members", [])
+        direction = group_cover.get("direction")
+        if direction in ("opening", "closing") and self._members_in_state(members, direction):
+            self._fire_group_cover_event(members, "stopped")
+            return
+
+        self._fire_group_cover_event(members, direction)
+
+    def _handle_group_cover_release(self, address: str) -> None:
+        group_cover = self._get_group_cover_for_code(address)
+        if not group_cover:
+            return
+        direction = group_cover.get("direction")
+        if direction in ("opening", "closing"):
+            self._fire_group_cover_event(group_cover.get("members", []), "stopped")
+
+    def _get_group_cover_for_code(self, address: str) -> Optional[dict]:
+        group_covers = (
+            self._coordinator.hass.data.get(DOMAIN, {}).get(CONF_GROUP_COVERS, [])
+        )
+        for cover in group_covers:
+            if cover.get(CONF_COVER_UP_CODE) == address:
+                return {"members": cover.get("members", []), "direction": "opening"}
+            if cover.get(CONF_COVER_DOWN_CODE) == address:
+                return {"members": cover.get("members", []), "direction": "closing"}
+            if cover.get(CONF_COVER_STOP_CODE) == address:
+                return {"members": cover.get("members", []), "direction": "stopped"}
+        return None
+
+    def _members_in_state(self, members: list[str], target_state: str) -> bool:
+        if not members:
+            return False
+        for entity_id in members:
+            state = self._coordinator.hass.states.get(entity_id)
+            if state and state.state == target_state:
+                return True
+        return False
+
+    def _fire_group_cover_event(self, members: list[str], direction: str) -> None:
+        self._coordinator.hass.bus.async_fire(
+            "nikobus_group_cover_command",
+            {"members": members, "direction": direction},
+        )

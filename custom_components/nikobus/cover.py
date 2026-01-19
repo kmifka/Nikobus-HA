@@ -20,12 +20,13 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers import device_registry as dr
-from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.event import async_track_time_interval, async_track_state_change_event
 
 from .const import (
     DOMAIN,
     BRAND,
     CONF_COVERS,
+    CONF_GROUP_COVERS,
     CONF_COVER_NAME,
     CONF_COVER_UP_CODE,
     CONF_COVER_DOWN_CODE,
@@ -256,6 +257,15 @@ async def async_setup_entry(
         ]
         async_add_entities(yaml_entities)
         _LOGGER.debug("Added %d YAML-defined Nikobus covers.", len(yaml_entities))
+
+    group_covers = hass.data.get(DOMAIN, {}).get(CONF_GROUP_COVERS, [])
+    if group_covers:
+        group_entities = [
+            NikobusYamlGroupCoverEntity(coordinator=coordinator, config=cover_config)
+            for cover_config in group_covers
+        ]
+        async_add_entities(group_entities)
+        _LOGGER.debug("Added %d YAML-defined Nikobus group covers.", len(group_entities))
 
 
 def _register_nikobus_roller_device(
@@ -774,6 +784,7 @@ class NikobusYamlCoverEntity(CoverEntity, RestoreEntity):
         else:
             self._tc = None
         self._unsubscribe_auto_updater = None
+        self._unsub_group_event = None
         self._is_manual_position = False
         self._stop_in_progress = False
         self._state: Optional[str] = None
@@ -786,12 +797,16 @@ class NikobusYamlCoverEntity(CoverEntity, RestoreEntity):
             CoverEntityFeature.OPEN
             | CoverEntityFeature.CLOSE
             | CoverEntityFeature.STOP
+            | CoverEntityFeature.SET_POSITION
         )
         if self._tc:
             self._attr_supported_features |= CoverEntityFeature.SET_POSITION
 
     async def async_added_to_hass(self) -> None:
         """Restore last known position."""
+        self._unsub_group_event = self.hass.bus.async_listen(
+            "nikobus_group_cover_command", self._handle_group_cover_command
+        )
         last_state = await self.async_get_last_state()
         if not self._tc:
             await self._assign_area()
@@ -939,6 +954,9 @@ class NikobusYamlCoverEntity(CoverEntity, RestoreEntity):
 
     async def async_will_remove_from_hass(self) -> None:
         self._stop_auto_updater()
+        if self._unsub_group_event:
+            self._unsub_group_event()
+            self._unsub_group_event = None
 
     def _start_auto_updater(self) -> None:
         if not self._unsubscribe_auto_updater:
@@ -975,5 +993,276 @@ class NikobusYamlCoverEntity(CoverEntity, RestoreEntity):
             self._stop_auto_updater()
             self.async_write_ha_state()
             self._stop_in_progress = False
+
+        self.async_write_ha_state()
+
+    async def _handle_group_cover_command(self, event: Any) -> None:
+        """Handle group cover commands and update local motion state."""
+        members = event.data.get("members") or []
+        direction = event.data.get("direction")
+        target_position = event.data.get("target_position")
+
+        if members:
+            members_lower = [str(m).lower() for m in members]
+            entity_match = self.entity_id and self.entity_id.lower() in members_lower
+            if not entity_match:
+                return
+        _LOGGER.info(
+            "Member cover handling group event: %s (direction=%s, target=%s)",
+            self.entity_id,
+            direction,
+            target_position,
+        )
+
+        if direction == "opening":
+            if self._tc:
+                self._is_manual_position = False
+                if target_position is not None:
+                    self._tc.start_travel(int(target_position))
+                else:
+                    self._tc.start_travel_up()
+                self._start_auto_updater()
+            self._state = "opening"
+        elif direction == "closing":
+            if self._tc:
+                self._is_manual_position = False
+                if target_position is not None:
+                    self._tc.start_travel(int(target_position))
+                else:
+                    self._tc.start_travel_down()
+                self._start_auto_updater()
+            self._state = "closing"
+        elif direction == "stopped":
+            if self._tc and self._tc.is_traveling():
+                self._tc.stop()
+            self._stop_auto_updater()
+            self._state = None
+        else:
+            return
+
+        self.async_write_ha_state()
+
+
+class NikobusYamlGroupCoverEntity(CoverEntity):
+    """Cover entity for raw group commands with aggregated member state."""
+
+    def __init__(self, coordinator: NikobusDataCoordinator, config: dict[str, Any]) -> None:
+        self._coordinator = coordinator
+        self._name = config[CONF_COVER_NAME]
+        self._up_code = config[CONF_COVER_UP_CODE]
+        self._down_code = config[CONF_COVER_DOWN_CODE]
+        self._stop_code = config[CONF_COVER_STOP_CODE]
+        self._unique_id = config["unique_id"]
+        self._area_name = config.get(CONF_COVER_AREA)
+        self._members = config.get("members", [])
+        self._unsub_state = None
+
+        self._attr_name = self._name
+        self._attr_unique_id = self._unique_id
+        self._attr_suggested_object_id = config.get("suggested_object_id")
+        self._attr_device_class = CoverDeviceClass.SHUTTER
+        self._attr_supported_features = (
+            CoverEntityFeature.OPEN
+            | CoverEntityFeature.CLOSE
+            | CoverEntityFeature.STOP
+            | CoverEntityFeature.SET_POSITION
+        )
+        self._attr_is_closed = None
+        self._attr_is_opening = False
+        self._attr_is_closing = False
+        self._attr_current_cover_position = None
+
+    async def async_added_to_hass(self) -> None:
+        await async_assign_area_if_missing(
+            self.hass, self.entity_id, self._area_name
+        )
+        await async_apply_suggested_entity_id(
+            self.hass,
+            self.entity_id,
+            "cover",
+            self._attr_name,
+            self._attr_suggested_object_id,
+        )
+        if self._members:
+            self._unsub_state = async_track_state_change_event(
+                self.hass, self._members, self._handle_member_state_change
+            )
+        self._refresh_group_state()
+
+    async def async_will_remove_from_hass(self) -> None:
+        if self._unsub_state:
+            self._unsub_state()
+            self._unsub_state = None
+
+    async def async_open_cover(self, **kwargs: Any) -> None:
+        _LOGGER.info(
+            "Group cover open requested: %s (members=%s)", self._attr_name, self._members
+        )
+        self._fire_group_event("opening")
+        sent = await self._send_command(
+            self._up_code, wait_for_completion=True, retries=1
+        )
+        if not sent:
+            _LOGGER.warning("Open command failed for %s", self._attr_name)
+            return
+
+    async def async_close_cover(self, **kwargs: Any) -> None:
+        _LOGGER.info(
+            "Group cover close requested: %s (members=%s)", self._attr_name, self._members
+        )
+        self._fire_group_event("closing")
+        sent = await self._send_command(
+            self._down_code, wait_for_completion=True, retries=1
+        )
+        if not sent:
+            _LOGGER.warning("Close command failed for %s", self._attr_name)
+            return
+
+    async def async_stop_cover(self, **kwargs: Any) -> None:
+        _LOGGER.info(
+            "Group cover stop requested: %s (members=%s)", self._attr_name, self._members
+        )
+        self._fire_group_event("stopped")
+        sent = await self._send_command(self._stop_code, wait_for_completion=True)
+        if not sent:
+            _LOGGER.warning("Stop command failed for %s", self._attr_name)
+            return
+
+    async def async_set_cover_position(self, **kwargs: Any) -> None:
+        position = kwargs.get(ATTR_POSITION)
+        if position is None:
+            return
+        if not self._members:
+            return
+
+        target = int(position)
+        # Determine direction based on average current position of members.
+        positions = []
+        for entity_id in self._members:
+            state = self.hass.states.get(entity_id)
+            if not state:
+                continue
+            pos = state.attributes.get(ATTR_POSITION)
+            if pos is None:
+                pos = state.attributes.get("current_position")
+            if pos is not None:
+                try:
+                    positions.append(float(pos))
+                except (TypeError, ValueError):
+                    pass
+
+        if not positions:
+            return
+
+        avg_position = sum(positions) / len(positions)
+        if target == int(round(avg_position)):
+            return
+
+        direction = "opening" if target > avg_position else "closing"
+        self._fire_group_event(direction, target_position=target)
+
+        code = self._up_code if direction == "opening" else self._down_code
+        sent = await self._send_command(code, wait_for_completion=True, retries=1)
+        if not sent:
+            _LOGGER.warning("Position command failed for %s", self._attr_name)
+
+    async def _send_command(
+        self, code: str, wait_for_completion: bool = False, retries: int = 0
+    ) -> bool:
+        command = f"#N{code}\r#E1"
+        return await send_repeated_command(
+            self._coordinator,
+            command,
+            wait_for_completion=wait_for_completion,
+            retries=retries,
+            use_burst_queue=True,
+        )
+
+    def _any_member_state(self, target_state: str) -> bool:
+        if not self._members:
+            return False
+        for entity_id in self._members:
+            state = self.hass.states.get(entity_id)
+            if state and state.state == target_state:
+                return True
+        return False
+
+    def _fire_group_event(self, direction: str, target_position: Optional[int] = None) -> None:
+        data: dict[str, Any] = {"members": self._members, "direction": direction}
+        if target_position is not None:
+            data["target_position"] = target_position
+        _LOGGER.info(
+            "Group cover event fired: %s (members=%s, target=%s)",
+            direction,
+            self._members,
+            target_position,
+        )
+        self.hass.bus.async_fire("nikobus_group_cover_command", data)
+
+    @callback
+    def _handle_member_state_change(self, event: Any) -> None:
+        self._refresh_group_state()
+
+    def _refresh_group_state(self) -> None:
+        if not self._members:
+            self._attr_current_cover_position = None
+            self._attr_is_opening = False
+            self._attr_is_closing = False
+            self._attr_is_closed = None
+            self.async_write_ha_state()
+            return
+
+        positions: list[float] = []
+        opening = False
+        closing = False
+        closed_count = 0
+        open_count = 0
+        total = 0
+
+        for entity_id in self._members:
+            state = self.hass.states.get(entity_id)
+            if not state:
+                continue
+            total += 1
+            if state.state == "opening":
+                opening = True
+            elif state.state == "closing":
+                closing = True
+            elif state.state == "closed":
+                closed_count += 1
+            elif state.state == "open":
+                open_count += 1
+
+            pos = state.attributes.get(ATTR_POSITION)
+            if pos is None:
+                pos = state.attributes.get("current_position")
+            if pos is not None:
+                try:
+                    positions.append(float(pos))
+                except (TypeError, ValueError):
+                    pass
+
+        if positions:
+            self._attr_current_cover_position = int(round(sum(positions) / len(positions)))
+        else:
+            self._attr_current_cover_position = None
+
+        if opening:
+            self._attr_is_opening = True
+            self._attr_is_closing = False
+            self._attr_is_closed = False
+        elif closing:
+            self._attr_is_opening = False
+            self._attr_is_closing = True
+            self._attr_is_closed = False
+        else:
+            self._attr_is_opening = False
+            self._attr_is_closing = False
+            if total > 0 and closed_count == total:
+                self._attr_is_closed = True
+            elif total > 0 and open_count == total:
+                self._attr_is_closed = False
+            else:
+                self._attr_is_closed = None
 
         self.async_write_ha_state()
