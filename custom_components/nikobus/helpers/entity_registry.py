@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from homeassistant.helpers import area_registry as ar, entity_registry as er
 from homeassistant.util import slugify
+
+_LOGGER = logging.getLogger(__name__)
 
 
 async def async_assign_area_if_missing(
@@ -58,8 +61,18 @@ async def async_apply_suggested_entity_id(
                 )
                 and entry.entity_id != desired_entity_id
             ):
-                ent_reg.async_update_entity(
-                    entry.entity_id, new_entity_id=desired_entity_id
-                )
+                if ent_reg.async_get(desired_entity_id) is not None:
+                    # Another entity already owns the suggested id - two groups in
+                    # the same area derive the same one. Renaming would raise and
+                    # abort adding this entity, so keep the id we already have.
+                    _LOGGER.warning(
+                        "Keeping entity id %s: suggested id %s is already taken",
+                        entry.entity_id,
+                        desired_entity_id,
+                    )
+                else:
+                    ent_reg.async_update_entity(
+                        entry.entity_id, new_entity_id=desired_entity_id
+                    )
             break
         await asyncio.sleep(0.2)

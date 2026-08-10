@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 from homeassistant.components.switch import SwitchEntity
@@ -21,6 +22,8 @@ from .const import (
     CONF_COVER_DOWN_CODE,
     CONF_COVER_STOP_CODE,
     CONF_COVER_AREA,
+    CONF_BUTTON_UP_CODES,
+    CONF_BUTTON_DOWN_CODES,
 )
 from .coordinator import NikobusDataCoordinator
 from .entity import NikobusEntity
@@ -275,6 +278,11 @@ class NikobusYamlCoverSwitchEntity(SwitchEntity):
         self._unique_id = f"{config['unique_id']}_switch"
         self._is_on = False
         self._area_name = config.get(CONF_COVER_AREA)
+        # For a cover exposed as a switch the two button lists mean on/off.
+        self._button_on_codes = config.get(CONF_BUTTON_UP_CODES) or []
+        self._button_off_codes = config.get(CONF_BUTTON_DOWN_CODES) or []
+        self._unsub_button_event = None
+        self._last_button_press: dict[str, float] = {}
 
         self._attr_name = self._name
         self._attr_unique_id = self._unique_id
@@ -293,6 +301,42 @@ class NikobusYamlCoverSwitchEntity(SwitchEntity):
             self._attr_name,
             self._attr_suggested_object_id,
         )
+        if (
+            self._button_on_codes or self._button_off_codes
+        ) and self._unsub_button_event is None:
+            self._unsub_button_event = self.hass.bus.async_listen(
+                "nikobus_button_pressed", self._handle_bus_button_press
+            )
+
+    async def async_will_remove_from_hass(self) -> None:
+        if self._unsub_button_event:
+            self._unsub_button_event()
+            self._unsub_button_event = None
+
+    async def _handle_bus_button_press(self, event: Any) -> None:
+        """Mirror a physical bus button onto this switch without sending anything."""
+        address = event.data.get("address")
+        if not address:
+            return
+        address = str(address).upper()
+        if address in self._button_on_codes:
+            new_state = True
+        elif address in self._button_off_codes:
+            new_state = False
+        else:
+            return
+
+        now = time.monotonic()
+        last = self._last_button_press.get(address)
+        self._last_button_press[address] = now
+        if last is not None and (now - last) < 0.5:
+            return
+
+        _LOGGER.info(
+            "Bus button mirrored onto %s: %s", self.entity_id, "on" if new_state else "off"
+        )
+        self._is_on = new_state
+        self.async_write_ha_state()
 
     @property
     def is_on(self) -> bool:

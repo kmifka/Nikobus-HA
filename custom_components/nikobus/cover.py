@@ -27,6 +27,13 @@ from .const import (
     BRAND,
     CONF_COVERS,
     CONF_GROUP_COVERS,
+    CONF_BUTTON_UP_CODES,
+    CONF_BUTTON_DOWN_CODES,
+    CONF_COVER_HIDDEN,
+    CONF_GROUP_STOP_TOLERANCE,
+    DEFAULT_GROUP_STOP_TOLERANCE,
+    CONF_END_STOP_CLEANUP_DELAY,
+    DEFAULT_END_STOP_CLEANUP_DELAY,
     CONF_COVER_NAME,
     CONF_COVER_UP_CODE,
     CONF_COVER_DOWN_CODE,
@@ -773,6 +780,10 @@ class NikobusYamlCoverEntity(CoverEntity, RestoreEntity):
         self._stop_code = config[CONF_COVER_STOP_CODE]
         self._unique_id = config["unique_id"]
         self._area_name = config.get(CONF_COVER_AREA)
+        self._button_up_codes = config.get(CONF_BUTTON_UP_CODES) or []
+        self._button_down_codes = config.get(CONF_BUTTON_DOWN_CODES) or []
+        self._unsub_button_event = None
+        self._last_button_press: Dict[str, float] = {}
 
         travel_up = config.get(CONF_TRAVEL_UP_TIME)
         travel_down = config.get(CONF_TRAVEL_DOWN_TIME)
@@ -787,6 +798,17 @@ class NikobusYamlCoverEntity(CoverEntity, RestoreEntity):
         self._unsub_group_event = None
         self._is_manual_position = False
         self._stop_in_progress = False
+        # Travel that only mirrors a physical bus button must never put a
+        # command back on the bus: the actuator is already doing the work.
+        self._suppress_stop_command = False
+        # Position the cover should stop at. The travel calculator itself always
+        # runs to the end stop, so the modelled position keeps advancing while a
+        # stop command is still queued - that is what the real shutter does.
+        self._pending_target: Optional[int] = None
+        # Counts every action on this cover. A pending cleanup only fires while
+        # the counter is unchanged, so anything that happens in between wins.
+        self._action_seq = 0
+        self._cleanup_task: Optional[asyncio.Task] = None
         self._state: Optional[str] = None
 
         self._attr_name = self._name
@@ -807,6 +829,15 @@ class NikobusYamlCoverEntity(CoverEntity, RestoreEntity):
         self._unsub_group_event = self.hass.bus.async_listen(
             "nikobus_group_cover_command", self._handle_group_cover_command
         )
+        if (
+            self._button_up_codes or self._button_down_codes
+        ) and self._unsub_button_event is None:
+            # Adding an entity can run twice (a rename re-adds it), so registering
+            # unconditionally would leave a leaked second listener behind and make
+            # every press act twice.
+            self._unsub_button_event = self.hass.bus.async_listen(
+                "nikobus_button_pressed", self._handle_bus_button_press
+            )
         last_state = await self.async_get_last_state()
         if not self._tc:
             await self._assign_area()
@@ -871,6 +902,7 @@ class NikobusYamlCoverEntity(CoverEntity, RestoreEntity):
         return False
 
     async def async_open_cover(self, **kwargs: Any) -> None:
+        self._cancel_end_stop_cleanup()
         sent = await self._send_command(
             self._up_code, wait_for_completion=True, retries=1
         )
@@ -885,6 +917,7 @@ class NikobusYamlCoverEntity(CoverEntity, RestoreEntity):
         self.async_write_ha_state()
 
     async def async_close_cover(self, **kwargs: Any) -> None:
+        self._cancel_end_stop_cleanup()
         sent = await self._send_command(
             self._down_code, wait_for_completion=True, retries=1
         )
@@ -899,6 +932,7 @@ class NikobusYamlCoverEntity(CoverEntity, RestoreEntity):
         self.async_write_ha_state()
 
     async def async_stop_cover(self, **kwargs: Any) -> None:
+        self._cancel_end_stop_cleanup()
         sent = await self._send_command(self._stop_code, wait_for_completion=True)
         if not sent:
             _LOGGER.warning("Stop command failed for %s", self._attr_name)
@@ -912,6 +946,7 @@ class NikobusYamlCoverEntity(CoverEntity, RestoreEntity):
     async def async_set_cover_position(self, **kwargs: Any) -> None:
         if not self._tc:
             return
+        self._cancel_end_stop_cleanup()
         position = kwargs.get(ATTR_POSITION)
         if position is None:
             return
@@ -937,7 +972,15 @@ class NikobusYamlCoverEntity(CoverEntity, RestoreEntity):
                 return
 
         self._is_manual_position = position not in (0, 100)
-        self._tc.start_travel(int(position))
+        # Fully open/close must run into the end stop so the shutter
+        # re-synchronises there; only an intermediate position needs a stop.
+        self._pending_target = int(position) if position not in (0, 100) else None
+        if position > current_position:
+            self._tc.start_travel_up()
+            self._state = "opening"
+        else:
+            self._tc.start_travel_down()
+            self._state = "closing"
         self._start_auto_updater()
 
     async def _send_command(
@@ -973,26 +1016,185 @@ class NikobusYamlCoverEntity(CoverEntity, RestoreEntity):
     async def _auto_updater_hook(self, now) -> None:
         if not self._tc:
             return
+
+        # Always publish the position, even while a stop command is still waiting
+        # in the queue - the shutter is physically still moving during that time.
+        self.async_write_ha_state()
+
         if self._stop_in_progress:
             return
 
-        # Persist intermediate position updates for reliable restore after restart.
-        self.async_write_ha_state()
+        position = self._tc.current_position()
+        if not self._target_reached(position):
+            return
 
-        if self._tc.position_reached():
-            self._stop_in_progress = True
-            target = self._tc.current_position()
-            if target not in (0, 100):
-                sent = await self._send_command(
-                    self._stop_code, wait_for_completion=True, retries=1
-                )
-                if not sent:
-                    self._stop_in_progress = False
-                    return
-            self._tc.stop()
+        self._stop_in_progress = True
+        if position not in (0, 100) and not self._suppress_stop_command:
+            sent = await self._send_command(
+                self._stop_code, wait_for_completion=True, retries=1
+            )
+            if not sent:
+                self._stop_in_progress = False
+                return
+        # Stop where the cover actually is now, not where it was when the command
+        # was queued.
+        self._tc.stop()
+        self._stop_auto_updater()
+        self._pending_target = None
+        self._suppress_stop_command = False
+        self._state = None
+        self._stop_in_progress = False
+        self.async_write_ha_state()
+        if position in (0, 100):
+            self._schedule_end_stop_cleanup()
+
+    def _cancel_end_stop_cleanup(self) -> None:
+        """Drop a pending cleanup because something else happened."""
+        self._action_seq += 1
+        if self._cleanup_task and not self._cleanup_task.done():
+            self._cleanup_task.cancel()
+        self._cleanup_task = None
+
+    def _schedule_end_stop_cleanup(self) -> None:
+        """Release the relay a while after the cover settled at an end position."""
+        delay = self.hass.data.get(DOMAIN, {}).get(
+            CONF_END_STOP_CLEANUP_DELAY, DEFAULT_END_STOP_CLEANUP_DELAY
+        )
+        if not delay:
+            return
+        self._action_seq += 1
+        seq = self._action_seq
+        if self._cleanup_task and not self._cleanup_task.done():
+            self._cleanup_task.cancel()
+        self._cleanup_task = self.hass.async_create_task(
+            self._run_end_stop_cleanup(seq, delay)
+        )
+
+    async def _run_end_stop_cleanup(self, seq: int, delay: int) -> None:
+        try:
+            await asyncio.sleep(delay)
+            if seq != self._action_seq:
+                return  # something moved this cover in the meantime
+            if self._tc and self._tc.is_traveling():
+                return
+            position = self._tc.current_position() if self._tc else None
+            if position not in (0, 100):
+                return
+            _LOGGER.info(
+                "Releasing relay for %s after %ss at %s%%",
+                self.entity_id,
+                delay,
+                position,
+            )
+            await self._send_command(self._stop_code, wait_for_completion=True)
+        except asyncio.CancelledError:
+            raise
+
+    def _target_reached(self, position: int) -> bool:
+        """Report whether the cover has arrived where it should stop."""
+        target = self._pending_target
+        if target is None:
+            return self._tc.position_reached()
+        if self._state == "opening":
+            return position >= target
+        if self._state == "closing":
+            return position <= target
+        return True
+
+    def _direction_for_button(self, address: Optional[str]) -> Optional[str]:
+        """Map a bus button address to a travel direction, if it is ours."""
+        if not address:
+            return None
+        address = str(address).upper()
+        if address in self._button_up_codes:
+            return "opening"
+        if address in self._button_down_codes:
+            return "closing"
+        return None
+
+    async def _handle_bus_button_press(self, event: Any) -> None:
+        """Mirror a physical bus button press onto this cover's state.
+
+        The Nikobus module reacts to the button on its own, so nothing is sent
+        here - only the internal travel state is updated. A press while the
+        cover is moving stops it, regardless of the direction pressed.
+        """
+        address = event.data.get("address")
+        direction = self._direction_for_button(address)
+        if direction is None:
+            return
+        if self._button_press_is_repeat(str(address).upper()):
+            return
+
+        if self._is_travelling():
+            direction = "stopped"
+
+        _LOGGER.info(
+            "Bus button mirrored onto %s: %s", self.entity_id, direction
+        )
+        self._apply_travel_state(direction, mirror_only=True)
+
+    def _button_press_is_repeat(self, address: str) -> bool:
+        """Swallow a repeated delivery of the same press within a short window."""
+        now = time.monotonic()
+        last = self._last_button_press.get(address)
+        self._last_button_press[address] = now
+        return last is not None and (now - last) < 0.5
+
+    def _is_travelling(self) -> bool:
+        """Report whether this cover is currently moving in either direction."""
+        if self._tc:
+            return self._tc.is_traveling()
+        return self._state in ("opening", "closing")
+
+    def _apply_travel_state(
+        self,
+        direction: str,
+        target_position: Optional[int] = None,
+        mirror_only: bool = False,
+        group_stop: bool = False,
+    ) -> None:
+        """Start or stop the travel calculator without sending any command.
+
+        With mirror_only the cover is following a physical bus button, so the
+        auto updater is barred from sending a stop code when it reaches an
+        intermediate target.
+        """
+        self._cancel_end_stop_cleanup()
+
+        if direction in ("opening", "closing"):
+            self._suppress_stop_command = mirror_only or group_stop
+            # With group_stop the group issues one stop for everyone, so this
+            # cover must not stop itself at the target.
+            self._pending_target = None if group_stop else target_position
+        elif direction == "stopped":
+            self._suppress_stop_command = False
+            self._pending_target = None
+
+        if direction == "opening":
+            if self._tc:
+                self._is_manual_position = False
+                self._tc.start_travel_up()
+                self._start_auto_updater()
+            self._state = "opening"
+        elif direction == "closing":
+            if self._tc:
+                self._is_manual_position = False
+                self._tc.start_travel_down()
+                self._start_auto_updater()
+            self._state = "closing"
+        elif direction == "stopped":
+            if self._tc and self._tc.is_traveling():
+                self._tc.stop()
             self._stop_auto_updater()
-            self.async_write_ha_state()
-            self._stop_in_progress = False
+            self._state = None
+            # Being stopped by a group at an end position still leaves this
+            # cover's relay engaged, so it needs the same cleanup job.
+            position = self._tc.current_position() if self._tc else None
+            if position in (0, 100):
+                self._schedule_end_stop_cleanup()
+        else:
+            return
 
         self.async_write_ha_state()
 
@@ -1014,33 +1216,20 @@ class NikobusYamlCoverEntity(CoverEntity, RestoreEntity):
             target_position,
         )
 
-        if direction == "opening":
-            if self._tc:
-                self._is_manual_position = False
-                if target_position is not None:
-                    self._tc.start_travel(int(target_position))
-                else:
-                    self._tc.start_travel_up()
-                self._start_auto_updater()
-            self._state = "opening"
-        elif direction == "closing":
-            if self._tc:
-                self._is_manual_position = False
-                if target_position is not None:
-                    self._tc.start_travel(int(target_position))
-                else:
-                    self._tc.start_travel_down()
-                self._start_auto_updater()
-            self._state = "closing"
-        elif direction == "stopped":
-            if self._tc and self._tc.is_traveling():
-                self._tc.stop()
-            self._stop_auto_updater()
-            self._state = None
-        else:
-            return
+        if direction == "stopped" and event.data.get("send_stop"):
+            # No group code covers this cover, so it stops itself.
+            position = self._tc.current_position() if self._tc else None
+            if position not in (0, 100):
+                await self._send_command(
+                    self._stop_code, wait_for_completion=True, retries=1
+                )
 
-        self.async_write_ha_state()
+        self._apply_travel_state(
+            direction,
+            target_position,
+            mirror_only=bool(event.data.get("mirror_only")),
+            group_stop=bool(event.data.get("group_stop")),
+        )
 
 
 class NikobusYamlGroupCoverEntity(CoverEntity):
@@ -1055,7 +1244,16 @@ class NikobusYamlGroupCoverEntity(CoverEntity):
         self._unique_id = config["unique_id"]
         self._area_name = config.get(CONF_COVER_AREA)
         self._members = config.get("members", [])
+        self._button_up_codes = config.get(CONF_BUTTON_UP_CODES) or []
+        self._button_down_codes = config.get(CONF_BUTTON_DOWN_CODES) or []
         self._unsub_state = None
+        self._unsub_button_event = None
+        self._last_button_press: Dict[str, float] = {}
+        self._group_stop_task: Optional[asyncio.Task] = None
+        # A button-only group still needs the entity - it carries the listener and
+        # the aggregated state - but it does not belong on any dashboard.
+        if config.get(CONF_COVER_HIDDEN):
+            self._attr_entity_registry_visible_default = False
 
         self._attr_name = self._name
         self._attr_unique_id = self._unique_id
@@ -1083,9 +1281,18 @@ class NikobusYamlGroupCoverEntity(CoverEntity):
             self._attr_name,
             self._attr_suggested_object_id,
         )
-        if self._members:
+        if self._members and self._unsub_state is None:
             self._unsub_state = async_track_state_change_event(
                 self.hass, self._members, self._handle_member_state_change
+            )
+        if (
+            self._button_up_codes or self._button_down_codes
+        ) and self._unsub_button_event is None:
+            # Adding an entity can run twice (a rename re-adds it), so registering
+            # unconditionally would leave a leaked second listener behind and make
+            # every press act twice.
+            self._unsub_button_event = self.hass.bus.async_listen(
+                "nikobus_button_pressed", self._handle_bus_button_press
             )
         self._refresh_group_state()
 
@@ -1093,6 +1300,40 @@ class NikobusYamlGroupCoverEntity(CoverEntity):
         if self._unsub_state:
             self._unsub_state()
             self._unsub_state = None
+        if self._unsub_button_event:
+            self._unsub_button_event()
+            self._unsub_button_event = None
+
+    async def _handle_bus_button_press(self, event: Any) -> None:
+        """Mirror a physical bus button press onto every member of this group.
+
+        The modules react to the button themselves, so no command is sent here.
+        A press while any member is moving stops the group, whatever direction
+        was pressed; the next press starts travel in the pressed direction.
+        """
+        address = event.data.get("address")
+        if not address:
+            return
+        address = str(address).upper()
+        if address in self._button_up_codes:
+            direction = "opening"
+        elif address in self._button_down_codes:
+            direction = "closing"
+        else:
+            return
+        if self._button_press_is_repeat(address):
+            return
+
+        if self._any_member_state("opening") or self._any_member_state("closing"):
+            direction = "stopped"
+
+        _LOGGER.info(
+            "Bus button mirrored onto group %s: %s (members=%s)",
+            self._attr_name,
+            direction,
+            self._members,
+        )
+        self._fire_group_event(direction, mirror_only=True)
 
     async def async_open_cover(self, **kwargs: Any) -> None:
         _LOGGER.info(
@@ -1137,7 +1378,136 @@ class NikobusYamlGroupCoverEntity(CoverEntity):
 
         target = int(position)
         # Determine direction based on average current position of members.
-        positions = []
+        positions = self._member_positions()
+        if not positions:
+            return
+
+        avg_position = sum(positions) / len(positions)
+        if target == int(round(avg_position)):
+            return
+
+        direction = "opening" if target > avg_position else "closing"
+
+        code = self._up_code if direction == "opening" else self._down_code
+
+        if target in (0, 100):
+            # Full open/close: let every member run into the end stop. No stop is
+            # sent at all, which is what re-synchronises the shutters.
+            _LOGGER.info(
+                "Group %s to %s%%: end stop, no stop command", self._attr_name, target
+            )
+            self._fire_group_event(direction)
+            if not await self._send_command(code, wait_for_completion=True, retries=1):
+                _LOGGER.warning("Position command failed for %s", self._attr_name)
+            return
+
+        # Every member is stopped by this group: either together with others via a
+        # configured group code, or individually. None of them stops itself.
+        self._fire_group_event(direction, target_position=target, group_stop=True)
+
+        sent = await self._send_command(code, wait_for_completion=True, retries=1)
+        if not sent:
+            _LOGGER.warning("Position command failed for %s", self._attr_name)
+            return
+
+        if self._group_stop_task and not self._group_stop_task.done():
+            self._group_stop_task.cancel()
+        self._group_stop_task = self.hass.async_create_task(
+            self._stop_group_at(target, direction)
+        )
+
+    async def _stop_group_at(self, target: int, direction: str) -> None:
+        """Stop the movement, always using the largest configured group that fits.
+
+        Members do not all arrive together - a short shutter reaches the target
+        long before a tall one. Whenever a configured group is completely ready,
+        that group is stopped with its own single code; anything not covered by
+        a group stops itself.
+        """
+        try:
+            tolerance = self.hass.data.get(DOMAIN, {}).get(
+                CONF_GROUP_STOP_TOLERANCE, DEFAULT_GROUP_STOP_TOLERANCE
+            )
+            pending = set(self._members)
+            for _ in range(1200):  # hard stop after ~6 minutes
+                if not pending:
+                    return
+                await asyncio.sleep(0.3)
+                soft = {m for m in pending if self._member_reached(m, target, direction, tolerance)}
+                hard = {m for m in pending if self._member_reached(m, target, direction, 0)}
+
+                # Group stops first: the biggest configured group fully inside the
+                # set that is (nearly) there.
+                while True:
+                    best = self._best_group_for(soft)
+                    if best is None:
+                        break
+                    name, members, stop_code = best
+                    if target not in (0, 100):
+                        await self._send_command(
+                            stop_code, wait_for_completion=True, retries=1
+                        )
+                    self._fire_group_event("stopped", members=sorted(members))
+                    _LOGGER.info(
+                        "Group stop via %s for %d cover(s): %s",
+                        name,
+                        len(members),
+                        sorted(members),
+                    )
+                    pending -= members
+                    soft -= members
+                    hard -= members
+
+                # Whatever is really there and not covered by a group stops itself.
+                for entity_id in sorted(hard):
+                    self._fire_group_event(
+                        "stopped", members=[entity_id], send_stop=(target not in (0, 100))
+                    )
+                    _LOGGER.info("Individual stop for %s", entity_id)
+                    pending.discard(entity_id)
+            _LOGGER.warning(
+                "Group %s: %d cover(s) never reached %s%%",
+                self._attr_name,
+                len(pending),
+                target,
+            )
+        except asyncio.CancelledError:
+            raise
+
+    def _member_reached(
+        self, entity_id: str, target: int, direction: str, tolerance: int
+    ) -> bool:
+        """Report whether a member is at the target, within the given slack."""
+        state = self.hass.states.get(entity_id)
+        if not state:
+            return False
+        pos = state.attributes.get(ATTR_POSITION)
+        if pos is None:
+            pos = state.attributes.get("current_position")
+        if pos is None:
+            return False
+        try:
+            pos = float(pos)
+        except (TypeError, ValueError):
+            return False
+        if direction == "opening":
+            return pos >= target - tolerance
+        return pos <= target + tolerance
+
+    def _best_group_for(self, ready: set) -> Optional[tuple]:
+        """Largest configured group whose members are all ready to be stopped."""
+        best = None
+        for cfg in self.hass.data.get(DOMAIN, {}).get(CONF_GROUP_COVERS, []) or []:
+            members = {str(m) for m in (cfg.get("members") or [])}
+            if not members or not members <= ready:
+                continue
+            if best is None or len(members) > len(best[1]):
+                best = (cfg.get(CONF_COVER_NAME), members, cfg.get(CONF_COVER_STOP_CODE))
+        return best
+
+    def _member_positions(self) -> list[float]:
+        """Current positions of all members that report one."""
+        out: list[float] = []
         for entity_id in self._members:
             state = self.hass.states.get(entity_id)
             if not state:
@@ -1147,24 +1517,10 @@ class NikobusYamlGroupCoverEntity(CoverEntity):
                 pos = state.attributes.get("current_position")
             if pos is not None:
                 try:
-                    positions.append(float(pos))
+                    out.append(float(pos))
                 except (TypeError, ValueError):
                     pass
-
-        if not positions:
-            return
-
-        avg_position = sum(positions) / len(positions)
-        if target == int(round(avg_position)):
-            return
-
-        direction = "opening" if target > avg_position else "closing"
-        self._fire_group_event(direction, target_position=target)
-
-        code = self._up_code if direction == "opening" else self._down_code
-        sent = await self._send_command(code, wait_for_completion=True, retries=1)
-        if not sent:
-            _LOGGER.warning("Position command failed for %s", self._attr_name)
+        return out
 
     async def _send_command(
         self, code: str, wait_for_completion: bool = False, retries: int = 0
@@ -1178,6 +1534,13 @@ class NikobusYamlGroupCoverEntity(CoverEntity):
             use_burst_queue=True,
         )
 
+    def _button_press_is_repeat(self, address: str) -> bool:
+        """Swallow a repeated delivery of the same press within a short window."""
+        now = time.monotonic()
+        last = self._last_button_press.get(address)
+        self._last_button_press[address] = now
+        return last is not None and (now - last) < 0.5
+
     def _any_member_state(self, target_state: str) -> bool:
         if not self._members:
             return False
@@ -1187,10 +1550,27 @@ class NikobusYamlGroupCoverEntity(CoverEntity):
                 return True
         return False
 
-    def _fire_group_event(self, direction: str, target_position: Optional[int] = None) -> None:
-        data: dict[str, Any] = {"members": self._members, "direction": direction}
+    def _fire_group_event(
+        self,
+        direction: str,
+        target_position: Optional[int] = None,
+        mirror_only: bool = False,
+        group_stop: bool = False,
+        members: Optional[list[str]] = None,
+        send_stop: bool = False,
+    ) -> None:
+        data: dict[str, Any] = {
+            "members": list(members) if members is not None else self._members,
+            "direction": direction,
+        }
         if target_position is not None:
             data["target_position"] = target_position
+        if mirror_only:
+            data["mirror_only"] = True
+        if group_stop:
+            data["group_stop"] = True
+        if send_stop:
+            data["send_stop"] = True
         _LOGGER.info(
             "Group cover event fired: %s (members=%s, target=%s)",
             direction,
@@ -1258,10 +1638,11 @@ class NikobusYamlGroupCoverEntity(CoverEntity):
         else:
             self._attr_is_opening = False
             self._attr_is_closing = False
-            if total > 0 and closed_count == total:
-                self._attr_is_closed = True
-            elif total > 0 and open_count == total:
-                self._attr_is_closed = False
+            if total > 0:
+                # Home Assistant convention: a cover counts as closed only when
+                # everything is closed, anything else is open. Reporting None for
+                # a mixed group would surface as "unknown".
+                self._attr_is_closed = closed_count == total
             else:
                 self._attr_is_closed = None
 

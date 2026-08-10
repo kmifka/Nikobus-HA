@@ -527,7 +527,12 @@ class NikobusActuator:
 
         members = group_cover.get("members", [])
         direction = group_cover.get("direction")
-        if direction in ("opening", "closing") and self._members_in_state(members, direction):
+        # A press while the covers are moving stops them, whatever direction was
+        # pressed; the next press starts travel in the pressed direction.
+        if direction in ("opening", "closing") and (
+            self._members_in_state(members, "opening")
+            or self._members_in_state(members, "closing")
+        ):
             self._fire_group_cover_event(members, "stopped")
             return
 
@@ -564,7 +569,9 @@ class NikobusActuator:
         return False
 
     def _fire_group_cover_event(self, members: list[str], direction: str) -> None:
+        # Always bus-originated: the actuators already reacted to the physical
+        # button, so members must mirror the motion without sending anything.
         self._coordinator.hass.bus.async_fire(
             "nikobus_group_cover_command",
-            {"members": members, "direction": direction},
+            {"members": members, "direction": direction, "mirror_only": True},
         )

@@ -38,6 +38,13 @@ from .const import (
     CONF_COVER_SIGNAL_REPEAT,
     CONF_COVER_AS_SWITCH,
     CONF_COVER_AREA,
+    CONF_BUTTON_UP_CODES,
+    CONF_BUTTON_DOWN_CODES,
+    CONF_COVER_HIDDEN,
+    CONF_GROUP_STOP_TOLERANCE,
+    DEFAULT_GROUP_STOP_TOLERANCE,
+    CONF_END_STOP_CLEANUP_DELAY,
+    DEFAULT_END_STOP_CLEANUP_DELAY,
 )
 from .coordinator import NikobusDataCoordinator
 
@@ -67,6 +74,8 @@ COVER_SCHEMA = vol.Schema(
         vol.Optional(CONF_TRAVEL_DOWN_TIME): vol.Coerce(float),
         vol.Optional(CONF_COVER_AS_SWITCH): vol.In(["up", "down"]),
         vol.Optional(CONF_COVER_AREA): cv.string,
+        vol.Optional(CONF_BUTTON_UP_CODES): vol.All(cv.ensure_list, [vol.Match(_CODE_REGEX)]),
+        vol.Optional(CONF_BUTTON_DOWN_CODES): vol.All(cv.ensure_list, [vol.Match(_CODE_REGEX)]),
     }
 )
 
@@ -78,6 +87,10 @@ GROUP_COVER_SCHEMA = vol.Schema(
         vol.Required(CONF_COVER_STOP_CODE): vol.Match(_CODE_REGEX),
         vol.Optional("members"): vol.All(cv.ensure_list, [cv.string]),
         vol.Optional(CONF_COVER_AREA): cv.string,
+        vol.Optional("suggested_object_id"): cv.string,
+        vol.Optional(CONF_BUTTON_UP_CODES): vol.All(cv.ensure_list, [vol.Match(_CODE_REGEX)]),
+        vol.Optional(CONF_BUTTON_DOWN_CODES): vol.All(cv.ensure_list, [vol.Match(_CODE_REGEX)]),
+        vol.Optional(CONF_COVER_HIDDEN, default=False): cv.boolean,
     }
 )
 
@@ -90,6 +103,12 @@ CONFIG_SCHEMA = vol.Schema(
                     cv.ensure_list, [GROUP_COVER_SCHEMA]
                 ),
                 vol.Optional(CONF_COVER_SIGNAL_REPEAT, default=1): cv.positive_int,
+                vol.Optional(
+                    CONF_GROUP_STOP_TOLERANCE, default=DEFAULT_GROUP_STOP_TOLERANCE
+                ): vol.All(vol.Coerce(int), vol.Range(min=0, max=100)),
+                vol.Optional(
+                    CONF_END_STOP_CLEANUP_DELAY, default=DEFAULT_END_STOP_CLEANUP_DELAY
+                ): vol.All(vol.Coerce(int), vol.Range(min=0, max=3600)),
             }
         )
     },
@@ -157,12 +176,38 @@ def _normalize_yaml_covers(raw_covers: list[dict]) -> list[dict]:
                 CONF_TRAVEL_DOWN_TIME: travel_down_time,
                 CONF_COVER_AS_SWITCH: cover.get(CONF_COVER_AS_SWITCH),
                 CONF_COVER_AREA: area_name,
+                CONF_BUTTON_UP_CODES: _normalize_button_codes(cover)[0],
+                CONF_BUTTON_DOWN_CODES: _normalize_button_codes(cover)[1],
                 "suggested_object_id": suggested_object_id,
                 "unique_id": unique_id,
             }
         )
 
     return normalized
+
+
+
+def _normalize_button_codes(cover: dict) -> tuple[list[str], list[str]]:
+    """Upper-case the configured bus button codes for both directions."""
+    up = [c.upper() for c in cover.get(CONF_BUTTON_UP_CODES, []) or []]
+    down = [c.upper() for c in cover.get(CONF_BUTTON_DOWN_CODES, []) or []]
+    return up, down
+
+
+def _normalize_group_object_id(value: str) -> str:
+    """Normalize group cover base name to a stable object id."""
+    replacements = {
+        "\u00e4": "ae",
+        "\u00f6": "oe",
+        "\u00fc": "ue",
+        "\u00c4": "Ae",
+        "\u00d6": "Oe",
+        "\u00dc": "Ue",
+        "\u00df": "ss",
+    }
+    for src, dst in replacements.items():
+        value = value.replace(src, dst)
+    return slugify(value)
 
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
@@ -184,6 +229,13 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             up_code = cover[CONF_COVER_UP_CODE].upper()
             down_code = cover[CONF_COVER_DOWN_CODE].upper()
             stop_code = cover[CONF_COVER_STOP_CODE].upper()
+            area_name = cover.get(CONF_COVER_AREA)
+            suggested_object_id = cover.get("suggested_object_id")
+            if suggested_object_id:
+                suggested_object_id = slugify(suggested_object_id)
+            else:
+                base_name = area_name or name
+                suggested_object_id = _normalize_group_object_id(base_name) + "_group"
             digest = hashlib.sha1(
                 ":".join(sorted([name, up_code, down_code, stop_code])).encode("utf-8")
             ).hexdigest()[:12]
@@ -195,15 +247,24 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                     CONF_COVER_DOWN_CODE: down_code,
                     CONF_COVER_STOP_CODE: stop_code,
                     "members": cover.get("members", []),
-                    CONF_COVER_AREA: cover.get(CONF_COVER_AREA),
+                    CONF_BUTTON_UP_CODES: _normalize_button_codes(cover)[0],
+                    CONF_BUTTON_DOWN_CODES: _normalize_button_codes(cover)[1],
+                    CONF_COVER_HIDDEN: bool(cover.get(CONF_COVER_HIDDEN, False)),
+                    CONF_COVER_AREA: area_name,
                     "unique_id": unique_id,
-                    "suggested_object_id": slugify(name),
+                    "suggested_object_id": suggested_object_id,
                 }
             )
         hass.data[DOMAIN][CONF_GROUP_COVERS] = normalized_group_covers
 
     hass.data[DOMAIN][CONF_COVER_SIGNAL_REPEAT] = config[DOMAIN].get(
         CONF_COVER_SIGNAL_REPEAT, 1
+    )
+    hass.data[DOMAIN][CONF_GROUP_STOP_TOLERANCE] = config[DOMAIN].get(
+        CONF_GROUP_STOP_TOLERANCE, DEFAULT_GROUP_STOP_TOLERANCE
+    )
+    hass.data[DOMAIN][CONF_END_STOP_CLEANUP_DELAY] = config[DOMAIN].get(
+        CONF_END_STOP_CLEANUP_DELAY, DEFAULT_END_STOP_CLEANUP_DELAY
     )
 
     return True

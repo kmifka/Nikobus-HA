@@ -31,6 +31,25 @@ CONF_COVER_SIGNAL_REPEAT: Final[str] = "cover_signal_repeat"
 CONF_COVER_AS_SWITCH: Final[str] = "as_switch"
 CONF_COVER_AREA: Final[str] = "area"
 
+# Physical bus buttons that drive a cover. These are the addresses a wall button
+# puts on the bus, which are distinct from the up/down/stop codes the integration
+# sends. The module reacts to them on its own, so they only mirror the state.
+CONF_BUTTON_UP_CODES: Final[str] = "button_up_codes"
+CONF_BUTTON_DOWN_CODES: Final[str] = "button_down_codes"
+
+# A group that exists only to mirror a physical button can be kept out of the UI.
+CONF_COVER_HIDDEN: Final[str] = "hidden"
+
+# How far member positions may differ (in percent) before a group still counts as
+# "all at the same height" and may be stopped with a single group command.
+CONF_GROUP_STOP_TOLERANCE: Final[str] = "group_stop_tolerance"
+DEFAULT_GROUP_STOP_TOLERANCE: Final[int] = 5
+
+# Seconds a cover may sit at an end position before a stop is sent to release the
+# relay in the cabinet. Any new action cancels it. 0 disables the cleanup.
+CONF_END_STOP_CLEANUP_DELAY: Final[str] = "end_stop_cleanup_delay"
+DEFAULT_END_STOP_CLEANUP_DELAY: Final[int] = 300
+
 # =============================================================================
 # Serial Connection
 # =============================================================================
