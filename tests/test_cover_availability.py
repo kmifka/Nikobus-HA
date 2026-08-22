@@ -124,29 +124,26 @@ def _make_group_cover(hass, coordinator):
 # ---------------------------------------------------------------------------
 # The hysteresis
 # ---------------------------------------------------------------------------
-async def test_a_single_missed_answer_leaves_the_cover_available(hass):
-    """One lost answer is normal traffic, not an outage."""
-    coordinator = _make_setup(hass)
-    cover = _make_cover(hass, coordinator)
-    assert cover.available is True
+async def test_the_first_missed_answer_takes_the_cover_away(hass):
+    """HEARTBEAT_FAILURE_THRESHOLD in a row - one poll, about 30 s of silence.
 
-    await coordinator.nikobus_heartbeat.async_poll()
-
-    assert coordinator.nikobus_heartbeat.consecutive_failures == 1
-    assert cover.available is True, "one missed answer must not take a blind away"
-
-
-async def test_three_missed_answers_make_the_cover_unavailable(hass):
-    """HEARTBEAT_FAILURE_THRESHOLD in a row - about 90 s of silence."""
+    Deliberately eager. Showing a blind as operable while nothing reaches it
+    invites somebody to press a button that does nothing, and the button they
+    press is often the one that would have retracted an awning. Coming back is
+    just as fast - one good answer restores it - so the cost of over-reacting
+    is bounded at one poll interval.
+    """
     coordinator = _make_setup(hass)
     cover = _make_cover(hass, coordinator)
     group = _make_group_cover(hass, coordinator)
+    assert cover.available is True
 
     for poll in range(1, HEARTBEAT_FAILURE_THRESHOLD + 1):
         await coordinator.nikobus_heartbeat.async_poll()
         if poll < HEARTBEAT_FAILURE_THRESHOLD:
             assert cover.available is True, f"too early after {poll} miss(es)"
 
+    assert coordinator.nikobus_heartbeat.consecutive_failures == HEARTBEAT_FAILURE_THRESHOLD
     assert coordinator.nikobus_heartbeat.is_alive is False
     assert cover.available is False
     assert group.available is False, "the group rides on the same bus"

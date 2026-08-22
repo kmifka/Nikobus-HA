@@ -136,6 +136,35 @@ The command goes through `queue_command` like every other one; the log shows
 the ping shares the pacing with the drive commands instead of competing with
 them.
 
+### How often does a ping go unanswered?
+
+This decides HEARTBEAT_FAILURE_THRESHOLD, and it was the last guessed number
+left in the design. The threshold started at 3 - about 90 s of silence - on the
+assumption that a lost answer is normal on a bus that also carries button
+traffic. That assumption was never tested, and everything measured here points
+the other way:
+
+* 0x1D answered on every attempt of the 254-code sweep.
+* All 43 samples of the clock run came back, none missing.
+* The query is serialised through the same queue as every drive command, so it
+  never competes with one for the line.
+
+Watched live on 22.08.2026 between 11:38:01 and 11:43:32 UTC: 12 consecutive
+polls, every gap exactly 30 s, no unanswered ping. That is a short window and
+it is reported as one - it rules out a bus that drops answers routinely, and
+nothing more. A longer run was started and deliberately called off; the
+threshold was set on the evidence above rather than on a day of statistics.
+
+If lost answers ever do show up on an otherwise healthy bus, this is the number
+to raise, and by then it would be a measurement instead of a judgement.
+
+The two directions of error are not symmetric, which is what makes 1 the right
+number rather than merely a permissible one. Reacting to a lost frame that
+meant nothing costs up to 30 s of "not responding" in Apple Home, which heals
+by itself on the next poll and cannot reach anybody's phone - Watchtower probes
+every 60 s and needs two consecutive failures, so a single-poll blip is
+invisible to it. Not reacting to a real outage is the two hours of 21.08.2026.
+
 ### The "constant" bytes are not entirely constant
 
 The four skipped bytes read `9BC1 0000` throughout the sweep and `9BC1 0001`

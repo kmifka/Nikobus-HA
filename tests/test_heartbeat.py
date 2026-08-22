@@ -339,17 +339,32 @@ async def test_the_clock_starts_running_again_and_so_does_the_verdict(hass):
     assert heartbeat.last_clock == "22:58"
 
 
-async def test_a_single_missed_answer_is_not_an_outage(hass):
-    """One lost answer on a bus that also carries button traffic is normal."""
+async def test_a_single_missed_answer_is_already_an_outage(hass):
+    """The first unanswered ping counts. See HEARTBEAT_FAILURE_THRESHOLD.
+
+    This used to assert the opposite, on the untested assumption that a lost
+    answer is normal on a bus that also carries button traffic. On this
+    installation it is not: 0x1D answered on every attempt of the 254-code
+    sweep and on all 43 samples of the clock run, and the query is serialised
+    through the same queue as every drive command, so it never competes with
+    one.
+
+    The two errors are not symmetric. Reacting to a lost frame that meant
+    nothing costs up to 30 s of "not responding" that heals by itself, and
+    cannot even reach a phone - Watchtower probes every 60 s and needs two
+    consecutive failures. Not reacting to a real outage is the two hours of
+    21.08.2026.
+    """
     _, heartbeat, command, clock = _make_heartbeat(
         hass, answers=[_clock_frame(20, 58)]
     )
     await heartbeat.async_poll()
+    assert heartbeat.is_alive is True
 
     clock.advance(30)
-    assert await heartbeat.async_poll() is True  # answers list is now empty
+    assert await heartbeat.async_poll() is False  # answers list is now empty
     assert heartbeat.consecutive_failures == 1
-    assert heartbeat.is_alive is True
+    assert heartbeat.is_alive is False
 
 
 async def test_three_missed_answers_are(hass):
@@ -365,19 +380,26 @@ async def test_three_missed_answers_are(hass):
 
 
 async def test_the_failure_counter_is_consecutive_not_cumulative(hass):
-    """Two misses spread around a good answer must not add up to three."""
+    """A good answer clears the count, and the verdict recovers with it.
+
+    The counter matters less now that the threshold is 1, but the clearing
+    still does: a bus that answers again must not stay condemned by misses it
+    has already made up for.
+    """
     _, heartbeat, command, clock = _make_heartbeat(hass, answers=[])
 
     await heartbeat.async_poll()
     await heartbeat.async_poll()
     assert heartbeat.consecutive_failures == 2
+    assert heartbeat.is_alive is False
 
     command.answers = [_clock_frame(30, 0)]
     await heartbeat.async_poll()
     assert heartbeat.consecutive_failures == 0
-
-    await heartbeat.async_poll()
-    assert heartbeat.is_alive is True
+    assert heartbeat.is_alive is True, (
+        "one good answer is enough to come back - the covers must not stay "
+        "unavailable while the installation is demonstrably working"
+    )
 
 
 async def test_an_unreadable_answer_counts_as_a_failure(hass):

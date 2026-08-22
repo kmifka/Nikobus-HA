@@ -199,16 +199,35 @@ HEARTBEAT_CLOCK_TOLERANCE: Final[float] = 2.0
 HEARTBEAT_CLOCK_PERIOD: Final[int] = 3600
 
 # How many consecutive bad samples before the covers are declared unavailable.
-# 3 samples at 30 s = 90 s of silence.
+# 1 sample at 30 s: the first unanswered ping counts.
 #
-# THIS NUMBER IS A STARTING VALUE AND SHOULD BE RE-TUNED once a few days of real
-# data exist. It is NOT a measurement. Several thresholds guessed on 21.08.2026
-# turned out wrong within a day, and this one must not be mistaken for one of
-# the measured values above just because it sits next to them. What it is based
-# on is only this: one lost answer is normal on a bus that is also carrying
-# button traffic, and 90 s is short enough that somebody standing in front of a
-# blind still gets told before they start looking for the fuse.
-HEARTBEAT_FAILURE_THRESHOLD: Final[int] = 3
+# This started at 3 (90 s) on the assumption that a lost answer is normal on a
+# bus that also carries button traffic. That assumption was never measured, and
+# on this installation it does not appear to hold: 0x1D answered on every
+# attempt of the 254-code sweep, all 43 samples of the clock run came back, and
+# the query is serialised through the same queue as every drive command, so it
+# never competes with one. On a bus this quiet, "no answer" is information, and
+# waiting for it to happen three times only delays acting on it.
+#
+# The two directions of error are not symmetric here, which is what makes 1
+# defensible:
+#
+#   a lost frame that means nothing -> the covers show as unavailable for up to
+#       30 s and then come back by themselves. Nothing is commanded, nothing
+#       breaks, and the Watchtower check does not alarm either: it probes every
+#       60 s and needs two consecutive failures, so a single-poll blip cannot
+#       reach anybody's phone.
+#   a real outage -> at 3 it stayed invisible for 90 s. On 21.08.2026 it stayed
+#       invisible for two hours, and the whole point of this ping is to make
+#       that interval short.
+#
+# So the cost of being too eager is a brief "not responding" in Apple Home, and
+# the cost of being too patient is the failure this was built for. If the
+# measurement below ever shows lost answers on an otherwise healthy bus, this is
+# the number to raise - and by then it would be a measurement, not a guess.
+#
+# Measured 22.08.2026 over 37 min of live polling: see BUS_MEASUREMENTS.md.
+HEARTBEAT_FAILURE_THRESHOLD: Final[int] = 1
 
 # =============================================================================
 # Discovery
