@@ -105,15 +105,38 @@ class NikobusDataCoordinator(DataUpdateCoordinator):
 
     @property
     def connection_status(self) -> str:
-        """Return 'connected', 'reconnecting', or 'disconnected'.
+        """Return 'connected', 'unreachable', 'reconnecting', or 'disconnected'.
 
         Read by NikobusConnectionSensor. Derived rather than stored, so it can
-        never disagree with the transport it describes - which is precisely
-        what went wrong on 21.08.2026, when Home Assistant's own view of the
-        integration ("loaded", every entity available) had nothing to do with
-        the state of the serial port.
+        never disagree with what it describes - which is precisely what went
+        wrong on 21.08.2026, when Home Assistant's own view of the integration
+        ("loaded", every entity available) had nothing to do with the state of
+        the serial port.
+
+        The four values answer one question - "would a command get through?" -
+        and name the reason it would not:
+
+            connected     the port is open and the installation answers.
+            unreachable   the port is open, the installation does not answer.
+            reconnecting  the port is shut, a reconnect is running.
+            disconnected  the port is shut.
+
+        `unreachable` was added on 22.08.2026 after pulling the power from the
+        installation while the USB adapter stayed in the host. Everything
+        behaved correctly - 25 covers went unavailable within one poll and the
+        alarm reached Home Assistant - and this sensor still read `connected`,
+        because the serial port really was open. True, and useless: the one
+        entity whose name promises to say whether Nikobus is reachable was the
+        only place still claiming it was.
+
+        The transport on its own remains available via `nikobus_connection.
+        is_connected` for the places that genuinely mean the port, and the
+        heartbeat detail stays in the sensor's attributes.
         """
         if self.nikobus_connection.is_connected:
+            heartbeat = self.nikobus_heartbeat
+            if heartbeat is not None and not heartbeat.is_alive:
+                return "unreachable"
             return "connected"
         if self._reconnect_task and not self._reconnect_task.done():
             return "reconnecting"

@@ -47,6 +47,9 @@ from .entity import hub_device_info
 PARALLEL_UPDATES = 0
 
 _CONNECTED = "connected"
+# The port is open, the installation behind it is not answering. See
+# coordinator.connection_status for why this is a state of its own.
+_UNREACHABLE = "unreachable"
 _RECONNECTING = "reconnecting"
 _DISCONNECTED = "disconnected"
 
@@ -68,7 +71,7 @@ class NikobusConnectionSensor(CoordinatorEntity[NikobusDataCoordinator], SensorE
     _attr_translation_key = "connection"
     _attr_entity_category = EntityCategory.DIAGNOSTIC
     _attr_device_class = SensorDeviceClass.ENUM
-    _attr_options = [_CONNECTED, _RECONNECTING, _DISCONNECTED]
+    _attr_options = [_CONNECTED, _UNREACHABLE, _RECONNECTING, _DISCONNECTED]
 
     def __init__(self, coordinator: NikobusDataCoordinator) -> None:
         """Initialize the sensor."""
@@ -123,12 +126,12 @@ class NikobusConnectionSensor(CoordinatorEntity[NikobusDataCoordinator], SensorE
             "reconnect_attempts": self.coordinator.reconnect_attempts,
         }
 
-        # The heartbeat answers a different question from the state above: the
-        # state describes the transport, these describe whether the
-        # installation behind it is still alive (nkbheartbeat.py). They are
-        # attributes rather than a fourth enum state so that existing
-        # dashboards, automations and the recorder keep seeing the same three
-        # values they were built against.
+        # The verdict itself is in the state - `unreachable` when the port is
+        # open but the installation stopped answering. These attributes are the
+        # detail behind it: which clock reading, how many failed polls, when it
+        # last answered. That last one doubles as a freshness signal, because a
+        # verdict nobody recomputes any more is indistinguishable from a
+        # healthy one (see nkbheartbeat._register_success).
         heartbeat = getattr(self.coordinator, "nikobus_heartbeat", None)
         if heartbeat is not None:
             last_ok = heartbeat.last_ok
