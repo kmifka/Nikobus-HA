@@ -18,8 +18,10 @@ from .const import (
     CONF_CONNECTION_STRING,
     CONF_REFRESH_INTERVAL,
     CONF_HAS_FEEDBACK_MODULE,
+    CONF_HEARTBEAT_ADDRESS,
     CONF_PRIOR_GEN3,
     CONF_DISABLE_DISCOVERY,
+    DEFAULT_HEARTBEAT_ADDRESS,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -56,6 +58,19 @@ def _build_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
                 CONF_DISABLE_DISCOVERY,
                 default=defaults.get(CONF_DISABLE_DISCOVERY, False),
             ): bool,
+            # Address of the module that answers function code 0x1D with a
+            # running clock — the liveness ping (see const.CONF_HEARTBEAT_ADDRESS
+            # for the 22.08.2026 measurements). It differs per installation,
+            # which is why it is asked for here instead of being hard-coded.
+            # Clearing the field switches the heartbeat off; that is better than
+            # pinging a guessed address, whose "no answer" would look exactly
+            # like a dead installation and would take every cover down with it.
+            vol.Optional(
+                CONF_HEARTBEAT_ADDRESS,
+                default=defaults.get(
+                    CONF_HEARTBEAT_ADDRESS, DEFAULT_HEARTBEAT_ADDRESS
+                ),
+            ): str,
         }
     )
 
@@ -188,6 +203,12 @@ class NikobusConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         CONF_DISABLE_DISCOVERY: user_input.get(
                             CONF_DISABLE_DISCOVERY,
                             existing_entry.data.get(CONF_DISABLE_DISCOVERY, False),
+                        ),
+                        CONF_HEARTBEAT_ADDRESS: user_input.get(
+                            CONF_HEARTBEAT_ADDRESS,
+                            existing_entry.data.get(
+                                CONF_HEARTBEAT_ADDRESS, DEFAULT_HEARTBEAT_ADDRESS
+                            ),
                         ),
                     },
                 )

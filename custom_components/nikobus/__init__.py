@@ -18,6 +18,7 @@ from homeassistant.components import (
     binary_sensor,
     button,
     scene,
+    sensor,
 )
 from .nkbconnect import NikobusConnect
 from .exceptions import NikobusConnectionError
@@ -57,6 +58,10 @@ PLATFORMS: Final[list[str]] = [
     binary_sensor.DOMAIN,
     button.DOMAIN,
     scene.DOMAIN,
+    # Carries the connection sensor only. Added after 21.08.2026, when a
+    # two-hour outage stayed invisible because nothing published the state of
+    # the serial transport.
+    sensor.DOMAIN,
 ]
 
 SCAN_MODULE_SCHEMA = vol.Schema({vol.Optional("module_address", default=""): cv.string})

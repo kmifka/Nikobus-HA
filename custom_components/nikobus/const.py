@@ -8,6 +8,13 @@ from typing import Final
 DOMAIN: Final[str] = "nikobus"
 BRAND: Final[str] = "Niko"
 
+# Device-registry identifier of the Nikobus bridge (hub). Upstream 3.x keeps it
+# here, so the port finds it in the expected place. NOTE: __init__.py, cover.py,
+# light.py and switch.py each still carry their own local copy of the same
+# literal; those are deliberately left untouched (they sit next to the YAML cover
+# identity code, which must not be modified), so the value has to stay "nikobus_hub".
+HUB_IDENTIFIER: Final[str] = "nikobus_hub"
+
 # =============================================================================
 # Configuration Keys
 # =============================================================================
@@ -97,6 +104,111 @@ COMMAND_REPEAT_BURST_DELAY: Final[float] = 0.1  # Delay between repeat burst com
 COMMAND_ACK_WAIT_TIMEOUT: Final[int] = 15  # Timeout for command ACK
 COMMAND_ANSWER_WAIT_TIMEOUT: Final[int] = 5  # Timeout for each loop waiting for an answer
 MAX_ATTEMPTS: Final[int] = 3  # Maximum retry attempts
+
+# =============================================================================
+# Reconnect
+# =============================================================================
+# On 21.08.2026 the host was rebooted and the USB enumeration order changed: the
+# FTDI adapter this Nikobus installation hangs on had been /dev/ttyUSB1 before
+# the reboot and was /dev/ttyUSB0 afterwards. Home Assistant still reported the
+# integration as "loaded" and all 26 cover entities stayed available, but every
+# single drive command died with
+#
+#     custom_components.nikobus.exceptions.NikobusSendError:
+#         Writer is not available for sending commands.
+#     nkbcommand.py, process_commands() -> nkbconnect.py send()
+#
+# for two hours. Nobody noticed until somebody stood in front of a blind that
+# would not move. The integration knew the whole time and only wrote it to the
+# log. These two values drive the supervised reconnect that closes that gap.
+#
+# Names and values are taken verbatim from upstream 3.x so that porting this
+# fork onto that base is a no-op for these constants.
+RECONNECT_DELAY_INITIAL: Final[int] = 5  # First retry delay in seconds
+RECONNECT_DELAY_MAX: Final[int] = 60  # Cap on exponential-backoff delay
+
+# =============================================================================
+# Heartbeat (is the installation still alive?)
+# =============================================================================
+# The reconnect above only knows whether the *transport* is open. It cannot see
+# a PC-Link that is still acknowledging on an open serial port while the rest of
+# the installation has stopped doing anything. This block is the answer to that
+# second question, and every value in it comes from a measurement run performed
+# on this installation on 22.08.2026.
+#
+# What this installation actually answers
+# ---------------------------------------
+# It has NO feedback module and runs prior_gen3. All 254 possible function codes
+# were tried on the bus:
+#
+#   * 0x12 and 0x17 (the output-state queries the coordinator polls with):
+#     NO answer at all. There is no output-state feedback on this installation.
+#     That is confirmed and it is not fixable from software.
+#   * Only 0x10, 0x11, 0x14, 0x18, 0x19, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F and 0x20
+#     answer at all. Everything from 0x21 upwards stays silent.
+#   * Most of those answer with $0E, "unknown response".
+#   * Response time was 0.20-0.21 s throughout, for every code that answered.
+#
+# The one useful answer: 0x1D carries a running clock
+# ---------------------------------------------------
+# 0x1D sent to address 9E62 answers with a frame that contains a CLOCK:
+#
+#     $051D $1C FF 629E 9BC1 0000 <MM> <SS> <CRC16> <CRC8>
+#
+# MM and SS are one byte each, read as hexadecimal, and the seconds roll over at
+# 60 rather than at 0xFF:
+#
+#     0x14 0x3A = 20:58   ->   0x15 0x01 = 21:01
+#
+# Over 43 samples in 141 s that clock ran exactly in step with the wall clock:
+# zero samples deviated by more than 1.5 s. Driving the shutters up and down
+# while sampling did not disturb it.
+#
+# Why a clock, and not just "something answered"
+# ----------------------------------------------
+# A constant answer only proves that *someone* replies; the reply can come out
+# of a buffer that a hung device never stops serving. That is exactly how a
+# weather station slipped through on 21.08.2026 - a valid, plausible reading
+# from a device that had been dead for hours. A clock cannot do that. If it
+# stands still while real time passes, the device is stuck, no matter how
+# politely it keeps acknowledging.
+HEARTBEAT_FUNCTION_CODE: Final[int] = 0x1D
+
+# The address the clock lives at. 9E62 is what was measured here on 22.08.2026;
+# other installations will have a different one, which is why this is only the
+# default and can be overridden per config entry (CONF_HEARTBEAT_ADDRESS). If no
+# address is configured the heartbeat stays switched off rather than guessing:
+# a wrong address answers $0E or not at all, which would look exactly like a
+# dead installation and would take all 26 covers down for no reason.
+CONF_HEARTBEAT_ADDRESS: Final[str] = "heartbeat_address"
+DEFAULT_HEARTBEAT_ADDRESS: Final[str] = "9E62"
+
+# One query every 30 s. The answer takes 0.21 s and goes through the same
+# command queue as everything else, which spaces commands by
+# COMMAND_EXECUTION_DELAY (0.7 s), so the ping costs well under 3% of the bus.
+HEARTBEAT_INTERVAL: Final[int] = 30
+
+# Seconds the clock may disagree with the elapsed wall time before the sample is
+# rejected. NOT a guess: the clock has a resolution of one second, so any single
+# comparison is already quantised by +-1 s, and the 43 samples of 22.08.2026
+# never drifted further than 1.5 s from the wall clock. +-2 s is that measured
+# spread rounded up to the next whole second.
+HEARTBEAT_CLOCK_TOLERANCE: Final[float] = 2.0
+
+# The clock wraps at 60:00, so all arithmetic on it is modulo one hour.
+HEARTBEAT_CLOCK_PERIOD: Final[int] = 3600
+
+# How many consecutive bad samples before the covers are declared unavailable.
+# 3 samples at 30 s = 90 s of silence.
+#
+# THIS NUMBER IS A STARTING VALUE AND SHOULD BE RE-TUNED once a few days of real
+# data exist. It is NOT a measurement. Several thresholds guessed on 21.08.2026
+# turned out wrong within a day, and this one must not be mistaken for one of
+# the measured values above just because it sits next to them. What it is based
+# on is only this: one lost answer is normal on a bus that is also carrying
+# button traffic, and 90 s is short enough that somebody standing in front of a
+# blind still gets told before they start looking for the fuse.
+HEARTBEAT_FAILURE_THRESHOLD: Final[int] = 3
 
 # =============================================================================
 # Discovery

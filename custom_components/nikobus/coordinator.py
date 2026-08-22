@@ -1,7 +1,9 @@
 """Coordinator for Nikobus integration."""
 
+import asyncio
+import contextlib
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
@@ -14,16 +16,21 @@ from .nkbconfig import NikobusConfig
 from .nkblistener import NikobusEventListener
 from .nkbcommand import NikobusCommandHandler
 from .nkbactuator import NikobusActuator
+from .nkbheartbeat import NikobusHeartbeat
 from .discovery import NikobusDiscovery
 
 from .const import (
     CONF_CONNECTION_STRING,
     CONF_REFRESH_INTERVAL,
     CONF_HAS_FEEDBACK_MODULE,
+    CONF_HEARTBEAT_ADDRESS,
     CONF_PRIOR_GEN3,
     CONF_COVERS,
     CONF_GROUP_COVERS,
+    DEFAULT_HEARTBEAT_ADDRESS,
     DOMAIN,
+    RECONNECT_DELAY_INITIAL,
+    RECONNECT_DELAY_MAX,
 )
 from .exceptions import NikobusConnectionError, NikobusDataError
 
@@ -72,6 +79,96 @@ class NikobusDataCoordinator(DataUpdateCoordinator):
         self._discovery_module = None
         self.discovery_module_address = None
         self._reload_task = None
+
+        # --- connection supervision -------------------------------------
+        # See const.RECONNECT_DELAY_* for the incident these exist for.
+        # Field names and semantics are upstream 3.x's, so the port in
+        # PORT_INVENTORY.md finds what it expects.
+        self._stopping: bool = False
+        self._reconnect_task: asyncio.Task | None = None
+        self._last_connected: datetime | None = None
+        self._reconnect_attempts: int = 0
+
+        # --- liveness supervision ---------------------------------------
+        # An open serial port is not a working installation. See
+        # nkbheartbeat.py for the 22.08.2026 measurements this is built on.
+        #
+        # The address is configuration, not a literal: 9E62 is what answers
+        # here, other installations have a different one. An explicitly empty
+        # value switches the heartbeat off rather than letting it guess, which
+        # would take all 26 covers down on a wrong address.
+        self._heartbeat_address = str(
+            config_entry.data.get(CONF_HEARTBEAT_ADDRESS, DEFAULT_HEARTBEAT_ADDRESS)
+            or ""
+        ).strip()
+        self.nikobus_heartbeat = NikobusHeartbeat(self, self._heartbeat_address)
+
+    @property
+    def connection_status(self) -> str:
+        """Return 'connected', 'reconnecting', or 'disconnected'.
+
+        Read by NikobusConnectionSensor. Derived rather than stored, so it can
+        never disagree with the transport it describes - which is precisely
+        what went wrong on 21.08.2026, when Home Assistant's own view of the
+        integration ("loaded", every entity available) had nothing to do with
+        the state of the serial port.
+        """
+        if self.nikobus_connection.is_connected:
+            return "connected"
+        if self._reconnect_task and not self._reconnect_task.done():
+            return "reconnecting"
+        return "disconnected"
+
+    @property
+    def system_available(self) -> bool:
+        """Whether commands sent right now would actually reach the shutters.
+
+        This is what the YAML cover entities publish as ``available``. Two
+        independent things have to hold, and each of them failed in a real
+        incident:
+
+        1. The transport is open. On 21.08.2026 it was not - the FTDI adapter
+           had moved from /dev/ttyUSB1 to /dev/ttyUSB0 - and every drive command
+           died in the writer for two hours while all 26 covers went on showing
+           as available and operable.
+        2. The installation behind it is still answering. That is the heartbeat,
+           and it is a separate question: the serial port can be perfectly open
+           while the PC-Link behind it has stopped doing anything.
+
+        The two are treated differently on purpose. A closed transport is a
+        certainty, so it counts immediately. A missing heartbeat answer is a
+        single sample on a shared bus, so it only counts after
+        HEARTBEAT_FAILURE_THRESHOLD of them in a row.
+
+        Showing a cover as available when neither holds is the same kind of lie
+        as a travel calculator reporting a position it computed for a shutter
+        that never moved (see cover._require_connection): it invites the user to
+        press a button that does nothing. Reporting unavailable makes Apple Home
+        say "not responding" instead of pretending the blind is operable.
+        """
+        if not self.nikobus_connection.is_connected:
+            return False
+        heartbeat = self.nikobus_heartbeat
+        if heartbeat is None:
+            return True
+        return heartbeat.is_alive
+
+    @property
+    def last_connected(self) -> datetime | None:
+        """Timestamp of the last successful connect (UTC), or ``None``.
+
+        Surfaced by the connection sensor's attributes.
+        """
+        return self._last_connected
+
+    @property
+    def reconnect_attempts(self) -> int:
+        """Consecutive reconnect attempts since the last successful connect.
+
+        Surfaced by the connection sensor's attributes. A value that keeps
+        climbing is the signal that the cause is not going to fix itself.
+        """
+        return self._reconnect_attempts
 
     def _get_update_interval(self) -> timedelta | None:
         """Compute the update interval based on configuration."""
@@ -149,9 +246,19 @@ class NikobusDataCoordinator(DataUpdateCoordinator):
                 # Expose API to Home Assistant
                 self.api = NikobusAPI(self.hass, self)
 
+                # The listener is the detector of connection loss: a send()
+                # failure closes the streams, so the next read() fails. Wiring
+                # the hook here (and again in _reconnect_loop) is upstream 3.x's
+                # arrangement.
+                self.nikobus_listener.on_connection_lost = self._handle_connection_lost
+
                 # Start event listener and command handler
                 await self.nikobus_command.start()
                 await self.nikobus_listener.start()
+                # Started after the command handler on purpose: the heartbeat
+                # queues its ping through it and has nothing to talk to before.
+                await self.nikobus_heartbeat.start()
+                self._last_connected = datetime.now(timezone.utc)
 
                 # Perform an initial data refresh
                 await self.async_refresh()
@@ -198,7 +305,24 @@ class NikobusDataCoordinator(DataUpdateCoordinator):
             )
 
     async def _async_update_data(self):
-        """Fetch the latest data from the Nikobus system."""
+        """Fetch the latest data from the Nikobus system.
+
+        Total-blackout auto-recovery (upstream issue #337): if every poll in a
+        single cycle fails - every output module runs into its timeout - the
+        bus is silent, and the same reconnect path the listener uses is
+        triggered.
+
+        This is a *different* failure from a dead transport, and the two can
+        fail independently: the serial port can be perfectly open while the
+        PC-Link behind it has gone to sleep (it does, after the 120 s gap
+        between polls), and the bus can be fine while the FTDI node vanished.
+        On 21.08.2026 it was the transport; this branch covers the other half.
+
+        Until now the fork could not see it at all: ``_refresh_module_type``
+        swallowed every per-module failure, logged an ERROR, kept looping, and
+        ``_async_update_data`` returned True either way. A cycle in which
+        nothing answered was indistinguishable from a healthy one.
+        """
         try:
             if not self._discovery_running:
                 _LOGGER.debug("Refreshing Nikobus data")
@@ -208,14 +332,46 @@ class NikobusDataCoordinator(DataUpdateCoordinator):
             raise UpdateFailed(f"Error fetching Nikobus data: {e}")
 
     async def _refresh_nikobus_data(self) -> bool:
-        """Refresh data from all Nikobus modules."""
-        for module_type in _MODULE_TYPES:
-            if module_type in self.dict_module_data:
-                await self._refresh_module_type(self.dict_module_data[module_type])
-        return True
+        """Refresh data from all Nikobus modules, watching for a silent bus."""
+        polled = 0
+        failures = 0
+        try:
+            for module_type in _MODULE_TYPES:
+                if module_type in self.dict_module_data:
+                    polled_n, failed_n = await self._refresh_module_type(
+                        self.dict_module_data[module_type]
+                    )
+                    polled += polled_n
+                    failures += failed_n
+            return True
+        finally:
+            if polled > 0 and failures == polled and not self._stopping:
+                _LOGGER.warning(
+                    "Nikobus poll cycle: %d/%d commands timed out - bus silent. "
+                    "Triggering reconnect.",
+                    failures,
+                    polled,
+                )
+                # Background task - this must not block the coordinator's
+                # refresh-cycle slot. ``_handle_connection_lost`` is idempotent
+                # (a no-op while a reconnect is already running), so a blackout
+                # lasting several cycles cannot start a retry storm.
+                self.hass.async_create_background_task(
+                    self._handle_connection_lost(),
+                    name="nikobus_blackout_recovery",
+                )
 
-    async def _refresh_module_type(self, modules_dict) -> None:
-        """Refresh data for a specific type of module."""
+    async def _refresh_module_type(self, modules_dict) -> tuple[int, int]:
+        """Refresh data for a specific type of module.
+
+        Returns ``(polled, failed)``. Per-module failures are still swallowed
+        so one bad module does not stop the others from refreshing in the same
+        cycle; only the aggregate counts leave this method, and they are what
+        ``_refresh_nikobus_data`` uses to tell "one module is deaf" from "the
+        whole bus is deaf".
+        """
+        polled = 0
+        failed = 0
         for address, module_data in modules_dict.items():
             _LOGGER.debug("Refreshing data for module address: %s", address)
             channels = module_data.get("channels", [])
@@ -223,6 +379,7 @@ class NikobusDataCoordinator(DataUpdateCoordinator):
             groups_to_query = (1,) if expected_channels <= 6 else (1, 2)
             group_states = []
             for group in groups_to_query:
+                polled += 1
                 try:
                     group_state = (
                         await self.nikobus_command.get_output_state(address, group)
@@ -234,9 +391,19 @@ class NikobusDataCoordinator(DataUpdateCoordinator):
                         group_state,
                         address,
                     )
+                    if not group_state:
+                        failed += 1
                     group_states.append(group_state)
+                except asyncio.CancelledError:
+                    raise
                 except Exception as e:
-                    _LOGGER.error(
+                    failed += 1
+                    # DEBUG, not ERROR (upstream made the same change): during
+                    # a bus-silent window this fires once per module per cycle
+                    # and floods the System Log, while the aggregate WARNING in
+                    # _refresh_nikobus_data already carries the actionable
+                    # signal. Individual failures stay available in a debug log.
+                    _LOGGER.debug(
                         "Error retrieving state for address %s, group %s: %s",
                         address,
                         group,
@@ -262,6 +429,7 @@ class NikobusDataCoordinator(DataUpdateCoordinator):
                     address,
                 )
                 self.nikobus_module_states[address] = bytearray(expected_channels)
+        return polled, failed
 
     async def process_feedback_data(self, module_group, data) -> None:
         """Process feedback data from Nikobus."""
@@ -387,6 +555,16 @@ class NikobusDataCoordinator(DataUpdateCoordinator):
         self._update_interval = self._get_update_interval()
         self.update_interval = self._update_interval
 
+        # A changed clock address means a different question is being asked, so
+        # the old verdict and the old baseline reading must not survive it.
+        heartbeat_address = str(
+            entry.data.get(CONF_HEARTBEAT_ADDRESS, DEFAULT_HEARTBEAT_ADDRESS) or ""
+        ).strip()
+        if heartbeat_address != self._heartbeat_address:
+            await self.nikobus_heartbeat.stop()
+            self._heartbeat_address = heartbeat_address
+            self.nikobus_heartbeat = NikobusHeartbeat(self, heartbeat_address)
+
         await self.connect()
         await self.async_refresh()
 
@@ -444,9 +622,132 @@ class NikobusDataCoordinator(DataUpdateCoordinator):
         """Get the state of a cover based on its address and channel."""
         return self.get_bytearray_state(address, channel)
 
+    # ------------------------------------------------------------------
+    # Connection lost / reconnect
+    # ------------------------------------------------------------------
+
+    async def _handle_connection_lost(self) -> None:
+        """Tear the protocol stack down and schedule a reconnect.
+
+        Called by the listener when its reader fails, and by the
+        blackout-recovery path in ``_refresh_nikobus_data``.
+
+        Idempotent on purpose: while a reconnect task is alive this is a
+        no-op. Both callers can fire for the same outage - blackout detection
+        notices the silent bus, the reconnect opens a new FD, the old
+        listener's pending read then fails and reports the loss as well - and
+        without the guard the second call would stop the command handler again
+        in the middle of the in-flight handshake. Upstream hit exactly that as
+        the "Reconnect 1 failed: Cannot send: Not connected." follow-up to
+        issue #337; coalescing at function entry collapses call #2 into
+        nothing.
+        """
+        if self._stopping:
+            return
+        if self._reconnect_task is not None and not self._reconnect_task.done():
+            _LOGGER.debug(
+                "Reconnect already in progress - coalescing duplicate "
+                "connection-lost notification"
+            )
+            return
+
+        _LOGGER.warning("Nikobus connection lost - scheduling reconnect")
+        # Push the state change out immediately so the connection sensor flips
+        # to "reconnecting" now, not after the first retry. The whole point of
+        # 21.08.2026 is that the outage must be visible while it is happening.
+        self.async_update_listeners()
+
+        if self.nikobus_command:
+            await self.nikobus_command.stop()
+        if self.nikobus_listener:
+            # Stop the listener BEFORE the reconnect runs. Left running, its
+            # pending read() on the old reader fires the moment connect()
+            # opens a new FD, read() closes the shared connection object
+            # mid-handshake, and the handshake's next send() fails - the
+            # reconnect then loses to its own predecessor. When the listener
+            # itself reported the loss, it is already leaving its loop and
+            # stop() is a no-op (see NikobusEventListener.stop, which refuses
+            # to cancel itself). Safe in both paths.
+            await self.nikobus_listener.stop()
+
+        self._reconnect_task = self.hass.async_create_background_task(
+            self._reconnect_loop(), name="nikobus_reconnect"
+        )
+
+    async def _reconnect_loop(self) -> None:
+        """Rebuild the transport, then bring the protocol stack back up.
+
+        ``nikobus_connection.reconnect_with_backoff`` owns the transport half
+        (close, reopen, re-run the handshake, exponential capped backoff,
+        retry forever). This loop only orchestrates the Home Assistant side:
+        clear state that belonged to the dead connection, restart the workers,
+        refresh, and tell the entities. That split is upstream 3.x's, where
+        the transport half lives in the external library instead.
+        """
+
+        def _on_attempt(attempt: int, _delay: float) -> None:
+            self._reconnect_attempts += 1
+            # Repaints the connection sensor's reconnect_attempts attribute.
+            self.async_update_listeners()
+
+        while not self._stopping:
+            try:
+                attempts = await self.nikobus_connection.reconnect_with_backoff(
+                    initial_delay=RECONNECT_DELAY_INITIAL,
+                    max_delay=RECONNECT_DELAY_MAX,
+                    on_attempt=_on_attempt,
+                )
+            except asyncio.CancelledError:
+                return  # stop() cancelled us
+
+            try:
+                # Drop state queued against the dead connection, then bring the
+                # pipeline back up on the new one.
+                self.nikobus_command.reset()
+                self.nikobus_listener.reset()
+                await self.nikobus_command.start()
+                self.nikobus_listener.on_connection_lost = self._handle_connection_lost
+                await self.nikobus_listener.start()
+                # Idempotent: the heartbeat task is not torn down for an outage,
+                # it just skips its polls while the transport is down (see
+                # NikobusHeartbeat._reason_to_skip). This only matters when the
+                # very first connect never got far enough to start it.
+                await self.nikobus_heartbeat.start()
+                self._last_connected = datetime.now(timezone.utc)
+                self._reconnect_attempts = 0
+                await self._async_update_data()
+                self.async_update_listeners()
+                _LOGGER.info("Nikobus reconnected after %d attempt(s)", attempts)
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                _LOGGER.exception(
+                    "Nikobus subsystem restart failed after reconnect - retrying"
+                )
+                await self.nikobus_connection.disconnect()
+
     async def stop(self) -> None:
         """Stop the coordinator and its running tasks."""
         _LOGGER.debug("Stopping NikobusDataCoordinator")
+        # Set first: it makes _handle_connection_lost a no-op, so the teardown
+        # below cannot trip the reconnect it is trying to shut down.
+        self._stopping = True
+
+        task = self._reconnect_task
+        self._reconnect_task = None
+        if task and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        if self.nikobus_heartbeat:
+            try:
+                await self.nikobus_heartbeat.stop()
+                _LOGGER.debug("Nikobus heartbeat stopped.")
+            except Exception as e:
+                _LOGGER.error("Error stopping Nikobus heartbeat: %s", e)
+
         if self.nikobus_listener:
             try:
                 await self.nikobus_listener.stop()
@@ -583,5 +884,15 @@ class NikobusDataCoordinator(DataUpdateCoordinator):
             unique_id = cover.get("unique_id")
             if unique_id:
                 known.add(unique_id)
+
+        # -----------------------
+        # 7) Bridge-level diagnostic entities
+        # -----------------------
+        # Without this the orphan cleanup in __init__ would delete the
+        # connection sensor on every single start: it removes any entity of
+        # this config entry whose unique_id is not in this set. Same literal
+        # as upstream 3.x, so the port keeps the entity instead of recreating
+        # it under a "_2" suffix.
+        known.add(f"{DOMAIN}_connection_status")
 
         return known

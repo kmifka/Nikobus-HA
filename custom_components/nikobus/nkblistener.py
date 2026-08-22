@@ -3,12 +3,12 @@
 from __future__ import annotations
 import logging
 import asyncio
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
-from custom_components.nikobus.exceptions import NikobusDataError
+from custom_components.nikobus.exceptions import NikobusDataError, NikobusReadError
 from .nkbprotocol import int_to_hex, calc_crc2
 from .const import (
     CONF_HAS_FEEDBACK_MODULE,
@@ -59,6 +59,12 @@ class NikobusEventListener:
         self.nikobus_discovery = nikobus_discovery
         self.response_queue: asyncio.Queue[str] = asyncio.Queue()
 
+        #: Called once when the reader notices the transport is gone.
+        #: The coordinator assigns ``_handle_connection_lost`` here; the name
+        #: and the "listener is the detector" split are taken from upstream
+        #: 3.x, where the library's listener owns the same hook.
+        self.on_connection_lost: Callable[[], Awaitable[None]] | None = None
+
     async def start(self) -> None:
         """Start the event listener."""
         self._running = True
@@ -68,13 +74,74 @@ class NikobusEventListener:
     async def stop(self) -> None:
         """Stop the event listener."""
         self._running = False
-        if self._listener_task:
-            self._listener_task.cancel()
+        task = self._listener_task
+        if task is None:
+            return
+        self._listener_task = None
+
+        if task is asyncio.current_task():
+            # Self-stop. The reader detected the connection loss and is calling
+            # the coordinator's ``_handle_connection_lost`` from inside this
+            # very task; that handler stops the listener as part of its
+            # teardown. Cancelling ourselves here would raise CancelledError
+            # right in the middle of the handler and the reconnect would never
+            # be scheduled - the outage would look exactly like 21.08.2026
+            # again. The loop is already on its way out, so there is nothing
+            # left to cancel.
+            _LOGGER.debug(
+                "Listener stop() called from within the listener task; "
+                "skipping self-cancel."
+            )
+            return
+
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            _LOGGER.info("Nikobus event listener has been stopped.")
+
+    def reset(self) -> None:
+        """Drop state that belonged to the dead connection.
+
+        Called by the coordinator between a reconnect and restarting the
+        listener (upstream 3.x calls the identically named ``listener.reset()``
+        at the same point). Answers that arrived on the old transport can never
+        be matched to a command issued on the new one, and leaving them in the
+        queue makes the first post-reconnect ``get_output_state`` return a
+        stale module state.
+        """
+        while True:
             try:
-                await self._listener_task
-            except asyncio.CancelledError:
-                _LOGGER.info("Nikobus event listener has been stopped.")
-            self._listener_task = None
+                self.response_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+    async def _notify_connection_lost(self, reason: str) -> None:
+        """Tell the coordinator the transport is gone, once.
+
+        The listener is the single detector of connection loss: a failing
+        ``send()`` closes the streams, which makes the very next ``read()``
+        fail here. Routing everything through one place is what keeps the
+        reconnect from being started twice (see the coalescing note in
+        ``coordinator._handle_connection_lost``).
+        """
+        if not self._running:
+            # Deliberate shutdown - stop() already tore the transport down.
+            return
+        self._running = False
+        _LOGGER.warning("Nikobus connection lost in listener: %s", reason)
+        if self.on_connection_lost is None:
+            _LOGGER.error(
+                "No connection-lost handler registered; the Nikobus connection "
+                "will NOT be rebuilt automatically."
+            )
+            return
+        try:
+            await self.on_connection_lost()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _LOGGER.exception("Connection-lost handler failed")
 
     def validate_crc(self, message: str) -> bool:
         """
@@ -136,7 +203,10 @@ class NikobusEventListener:
                     self.nikobus_connection.read(), timeout=10
                 )
                 if not data:
-                    _LOGGER.warning("Nikobus connection closed unexpectedly.")
+                    # EOF on the reader: the far side is gone (unplugged FTDI,
+                    # closed ser2net session). Hand it to the coordinator and
+                    # leave the loop - it is restarted after the reconnect.
+                    await self._notify_connection_lost("reader returned EOF")
                     break
 
                 message = data.decode("Windows-1252").strip()
@@ -144,14 +214,26 @@ class NikobusEventListener:
                 self._hass.async_create_task(self.dispatch_message(message))
 
             except asyncio.TimeoutError:
+                # A quiet bus is normal: nothing happens in the house for
+                # minutes at a time. Not a connection problem.
                 _LOGGER.debug("Read operation timed out. Waiting for next data...")
             except asyncio.CancelledError:
                 _LOGGER.info("Event listener was cancelled.")
+                break
+            except NikobusReadError as err:
+                # read() already closed the streams, so retrying here would
+                # spin at full speed on "Reader is not available". Exit and let
+                # the reconnect bring a new listener up.
+                await self._notify_connection_lost(str(err))
+                break
+            except OSError as err:
+                await self._notify_connection_lost(f"transport error: {err}")
                 break
             except Exception as err:
                 _LOGGER.error(
                     "Unexpected error in event listener: %s", err, exc_info=True
                 )
+                await self._notify_connection_lost(f"listener error: {err}")
                 break
 
     async def dispatch_message(self, message: str) -> None:

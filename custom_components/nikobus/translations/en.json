@@ -8,7 +8,8 @@
                     "connection_string": "IP address:Port or Serial device",
                     "has_feedback_module": "Feedback Module installed and connected over PC-Link ?",
                     "disable_discovery": "Disable Automatic Discovery",
-                    "prior_gen3": "Installation prior to Gen3?"
+                    "prior_gen3": "Installation prior to Gen3?",
+                    "heartbeat_address": "Address that answers the liveness clock (empty = heartbeat off)"
                 }
             },
             "reconfigure": {
@@ -19,7 +20,8 @@
                     "has_feedback_module": "Feedback Module installed?",
                     "refresh_interval": "Refresh interval (seconds)",
                     "prior_gen3": "Installation prior to Gen3?",
-                    "disable_discovery": "Disable Automatic Discovery"
+                    "disable_discovery": "Disable Automatic Discovery",
+                    "heartbeat_address": "Address that answers the liveness clock (empty = heartbeat off)"
                 }
             }
         },
@@ -33,5 +35,17 @@
             "device_not_found_or_no_access": "Serial device not found or no access."
         }
     },
-    "options": {}
+    "options": {},
+    "entity": {
+        "sensor": {
+            "connection": {
+                "name": "Connection",
+                "state": {
+                    "connected": "Connected",
+                    "reconnecting": "Reconnecting",
+                    "disconnected": "Disconnected"
+                }
+            }
+        }
+    }
 }

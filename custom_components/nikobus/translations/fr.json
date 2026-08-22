@@ -8,7 +8,8 @@
                     "connection_string": "Adresse IP:Port ou Périphérique Série",
                     "has_feedback_module": "Module de retour installé et connecté via PC-Link ?",
                     "disable_discovery": "Désactiver la découverte automatique",
-                    "prior_gen3": "Installation antérieure à Gen3 ?"
+                    "prior_gen3": "Installation antérieure à Gen3 ?",
+                    "heartbeat_address": "Adresse répondant à l'horloge de présence (vide = désactivé)"
                 }
             },
             "reconfigure": {
@@ -19,7 +20,8 @@
                     "has_feedback_module": "Module de retour installé ?",
                     "refresh_interval": "Intervalle de rafraîchissement (secondes)",
                     "prior_gen3": "Installation antérieure à Gen3 ?",
-                    "disable_discovery": "Désactiver la découverte automatique"
+                    "disable_discovery": "Désactiver la découverte automatique",
+                    "heartbeat_address": "Adresse répondant à l'horloge de présence (vide = désactivé)"
                 }
             }
         },
@@ -33,5 +35,17 @@
             "device_not_found_or_no_access": "Périphérique série non trouvé ou accès refusé."
         }
     },
-    "options": {}
+    "options": {},
+    "entity": {
+        "sensor": {
+            "connection": {
+                "name": "Connexion",
+                "state": {
+                    "connected": "Connecté",
+                    "reconnecting": "Reconnexion en cours",
+                    "disconnected": "Déconnecté"
+                }
+            }
+        }
+    }
 }

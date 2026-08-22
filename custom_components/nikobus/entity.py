@@ -8,8 +8,30 @@ from homeassistant.helpers.device_registry import DeviceEntry
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import BRAND, DOMAIN
+from .const import BRAND, DOMAIN, HUB_IDENTIFIER
 from .coordinator import NikobusDataCoordinator
+
+
+def hub_device_info() -> DeviceInfo:
+    """DeviceInfo for the Nikobus bridge (hub).
+
+    Single source of truth for the bridge device: the ``via_device`` parent of
+    the module devices and the device the bridge-level entities (currently the
+    connection sensor) attach to.
+
+    Taken from upstream 3.x, where it is also shared with the hub registration
+    in ``__init__``. Here it is NOT - ``__init__._register_hub_device`` still
+    builds its own dict with the same three values, because that function sits
+    in the file that also derives the YAML cover unique_ids and that file is
+    off limits. The values below must therefore stay byte-identical to it, or
+    Home Assistant will rename the bridge device on the next start.
+    """
+    return DeviceInfo(
+        identifiers={(DOMAIN, HUB_IDENTIFIER)},
+        name="Nikobus Bridge",
+        manufacturer=BRAND,
+        model="PC-Link Bridge",
+    )
 
 
 class NikobusEntity(CoordinatorEntity):

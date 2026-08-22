@@ -8,7 +8,8 @@
                     "connection_string": "IP-adres:Poort of Serieel apparaat",
                     "has_feedback_module": "Feedbackmodule geïnstalleerd en verbonden via PC-Link?",
                     "disable_discovery": "Automatische ontdekking uitschakelen",
-                    "prior_gen3": "Installatie vóór Gen3?"
+                    "prior_gen3": "Installatie vóór Gen3?",
+                    "heartbeat_address": "Adres dat de levensteken-klok beantwoordt (leeg = heartbeat uit)"
                 }
             },
             "reconfigure": {
@@ -19,7 +20,8 @@
                     "has_feedback_module": "Feedbackmodule geïnstalleerd?",
                     "refresh_interval": "Verversingsinterval (seconden)",
                     "prior_gen3": "Installatie vóór Gen3?",
-                    "disable_discovery": "Automatische ontdekking uitschakelen"
+                    "disable_discovery": "Automatische ontdekking uitschakelen",
+                    "heartbeat_address": "Adres dat de levensteken-klok beantwoordt (leeg = heartbeat uit)"
                 }
             }
         },
@@ -33,5 +35,17 @@
             "device_not_found_or_no_access": "Serieel apparaat niet gevonden of geen toegang."
         }
     },
-    "options": {}
+    "options": {},
+    "entity": {
+        "sensor": {
+            "connection": {
+                "name": "Verbinding",
+                "state": {
+                    "connected": "Verbonden",
+                    "reconnecting": "Opnieuw verbinden",
+                    "disconnected": "Verbinding verbroken"
+                }
+            }
+        }
+    }
 }

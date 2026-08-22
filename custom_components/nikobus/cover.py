@@ -17,6 +17,7 @@ from homeassistant.components.cover import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers import device_registry as dr
@@ -177,6 +178,64 @@ def _clamp_position(value: Optional[float]) -> Optional[int]:
     if value is None:
         return None
     return int(max(0, min(100, round(value))))
+
+
+def _require_connection(coordinator: NikobusDataCoordinator, entity_name: str) -> None:
+    """Refuse to drive a cover while the Nikobus transport is down.
+
+    Why this is a hard failure and not a warning
+    -------------------------------------------
+    A cover command that never reaches the bus does not move anything, but the
+    travel calculator does not know that - it starts its timer and Home
+    Assistant then reports a confident 40% for a blind hanging motionless at
+    the top. Real and modelled state drift apart, and nothing looks wrong until
+    somebody walks past a window.
+
+    That is precisely what happened on 21.08.2026: for two hours every command
+    failed in the writer, and the only trace was a log line. So:
+
+    * the estimator is not started at all (the old position is still correct -
+      nothing moved), and
+    * the failure is raised, not swallowed, so the caller sees it. A service
+      call fails visibly, an automation errors, and the user is told instead of
+      being shown a plausible number.
+
+    Upstream 3.x has no equivalent check; see helpers/travelcalculator.py for
+    why this fork deliberately goes further.
+    """
+    connection = getattr(coordinator, "nikobus_connection", None)
+    if connection is None or connection.is_connected:
+        return
+    status = getattr(coordinator, "connection_status", "disconnected")
+    _LOGGER.warning(
+        "Refusing to move %s: Nikobus connection is %s.", entity_name, status
+    )
+    raise HomeAssistantError(
+        f"Nikobus is {status}; '{entity_name}' was not moved. "
+        "The command would not have reached the bus."
+    )
+
+
+def _system_is_available(coordinator: NikobusDataCoordinator) -> bool:
+    """Return whether a command sent right now would reach the shutters.
+
+    The verdict itself lives on the coordinator (``system_available``): the
+    transport has to be open AND the installation has to still be answering the
+    heartbeat clock. See coordinator.system_available and nkbheartbeat.py.
+
+    Why the covers publish it as ``available`` at all
+    -------------------------------------------------
+    A shutter whose commands land in the void IS not available. Showing it as
+    operable is the same lie as a travel calculator reporting a position for a
+    blind that never moved - both invite the user to act on something that is
+    not true. Reported honestly, Home Assistant greys the entity out and Apple
+    Home says "not responding" instead of offering a slider that does nothing.
+
+    ``getattr`` with a default, because a few tests and the reconfigure path
+    build cover entities against objects that are not a full coordinator yet;
+    an unknown state must not be read as "broken".
+    """
+    return bool(getattr(coordinator, "system_available", True))
 
 
 def _safe_cancel(task: Optional[asyncio.Task]) -> None:
@@ -483,15 +542,19 @@ class NikobusCoverEntity(NikobusEntity, CoverEntity, RestoreEntity):
                 )
 
     async def async_open_cover(self, **kwargs: Any) -> None:
+        _require_connection(self.coordinator, self._attr_name)
         await self._request_cover_motion("opening")
 
     async def async_close_cover(self, **kwargs: Any) -> None:
+        _require_connection(self.coordinator, self._attr_name)
         await self._request_cover_motion("closing")
 
     async def async_stop_cover(self, **kwargs: Any) -> None:
+        _require_connection(self.coordinator, self._attr_name)
         await self._end_motion(send_stop=True)
 
     async def async_set_cover_position(self, **kwargs: Any) -> None:
+        _require_connection(self.coordinator, self._attr_name)
         target_position = kwargs.get(ATTR_POSITION)
         if target_position is None:
             return
@@ -810,6 +873,12 @@ class NikobusYamlCoverEntity(CoverEntity, RestoreEntity):
         self._action_seq = 0
         self._cleanup_task: Optional[asyncio.Task] = None
         self._state: Optional[str] = None
+        # Last availability this entity published. Kept so the coordinator
+        # listener can write a state only when the answer actually changed -
+        # the coordinator notifies on every button press and every refresh, and
+        # repainting 26 covers each time would be pure noise.
+        self._unsub_coordinator = None
+        self._last_available: Optional[bool] = None
 
         self._attr_name = self._name
         self._attr_unique_id = self._unique_id
@@ -826,6 +895,7 @@ class NikobusYamlCoverEntity(CoverEntity, RestoreEntity):
 
     async def async_added_to_hass(self) -> None:
         """Restore last known position."""
+        self._subscribe_to_availability()
         self._unsub_group_event = self.hass.bus.async_listen(
             "nikobus_group_cover_command", self._handle_group_cover_command
         )
@@ -878,6 +948,21 @@ class NikobusYamlCoverEntity(CoverEntity, RestoreEntity):
         )
 
     @property
+    def available(self) -> bool:
+        """Whether this shutter can actually be driven right now.
+
+        Until 22.08.2026 this class had no ``available`` at all, so Home
+        Assistant assumed "yes, always" - which is how all 26 covers stayed
+        fully operable through the two-hour outage on 21.08.2026 while every
+        command was dying in the writer.
+
+        The verdict is the coordinator's; see ``_system_is_available`` for why
+        a cover that cannot be reached must say so rather than keep up
+        appearances.
+        """
+        return _system_is_available(self._coordinator)
+
+    @property
     def current_cover_position(self) -> Optional[int]:
         if not self._tc:
             return None
@@ -896,12 +981,20 @@ class NikobusYamlCoverEntity(CoverEntity, RestoreEntity):
         return self._state == "closing"
 
     @property
-    def is_closed(self) -> bool:
+    def is_closed(self) -> Optional[bool]:
         if self._tc:
+            if not self._tc.position_known:
+                # None makes Home Assistant render the cover as "unknown"
+                # rather than picking open or closed. That is the whole point
+                # after a mid-travel connection loss: an honest gap beats a
+                # confident guess, and it is what tells the user to run the
+                # blind fully once.
+                return None
             return self._tc.is_closed()
         return False
 
     async def async_open_cover(self, **kwargs: Any) -> None:
+        _require_connection(self._coordinator, self._attr_name)
         self._cancel_end_stop_cleanup()
         sent = await self._send_command(
             self._up_code, wait_for_completion=True, retries=1
@@ -917,6 +1010,7 @@ class NikobusYamlCoverEntity(CoverEntity, RestoreEntity):
         self.async_write_ha_state()
 
     async def async_close_cover(self, **kwargs: Any) -> None:
+        _require_connection(self._coordinator, self._attr_name)
         self._cancel_end_stop_cleanup()
         sent = await self._send_command(
             self._down_code, wait_for_completion=True, retries=1
@@ -932,6 +1026,7 @@ class NikobusYamlCoverEntity(CoverEntity, RestoreEntity):
         self.async_write_ha_state()
 
     async def async_stop_cover(self, **kwargs: Any) -> None:
+        _require_connection(self._coordinator, self._attr_name)
         self._cancel_end_stop_cleanup()
         sent = await self._send_command(self._stop_code, wait_for_completion=True)
         if not sent:
@@ -946,10 +1041,21 @@ class NikobusYamlCoverEntity(CoverEntity, RestoreEntity):
     async def async_set_cover_position(self, **kwargs: Any) -> None:
         if not self._tc:
             return
+        _require_connection(self._coordinator, self._attr_name)
         self._cancel_end_stop_cleanup()
         position = kwargs.get(ATTR_POSITION)
         if position is None:
             return
+
+        if not self._tc.position_known and position not in (0, 100):
+            # The position was thrown away after a connection loss and there is
+            # nothing to interpolate from - a Nikobus roller relay reports no
+            # position, so an intermediate target cannot be computed, only
+            # guessed. Say so instead of inventing a starting point.
+            raise HomeAssistantError(
+                f"Position of '{self._attr_name}' is unknown after a connection "
+                "loss. Open or close it fully once to re-establish it."
+            )
 
         current_position = self._tc.current_position()
         if current_position is None:
@@ -997,9 +1103,37 @@ class NikobusYamlCoverEntity(CoverEntity, RestoreEntity):
 
     async def async_will_remove_from_hass(self) -> None:
         self._stop_auto_updater()
+        if self._unsub_coordinator:
+            self._unsub_coordinator()
+            self._unsub_coordinator = None
         if self._unsub_group_event:
             self._unsub_group_event()
             self._unsub_group_event = None
+
+    def _subscribe_to_availability(self) -> None:
+        """Listen for coordinator updates so availability can be repainted.
+
+        These YAML covers are not CoordinatorEntity - they carry their own
+        travel calculator and are driven by raw bus codes, not by module state -
+        so nothing was pushing them a state update. Without this subscription
+        ``available`` would only change the next time the entity happened to
+        write its state for some other reason, and an installation that stopped
+        answering would go on looking operable for as long as nobody touched it.
+        """
+        add_listener = getattr(self._coordinator, "async_add_listener", None)
+        if add_listener is None or self._unsub_coordinator is not None:
+            return
+        self._last_available = self.available
+        self._unsub_coordinator = add_listener(self._handle_availability_update)
+
+    @callback
+    def _handle_availability_update(self) -> None:
+        """Write a state only when availability actually flipped."""
+        available = self.available
+        if available == self._last_available:
+            return
+        self._last_available = available
+        self.async_write_ha_state()
 
     def _start_auto_updater(self) -> None:
         if not self._unsubscribe_auto_updater:
@@ -1012,9 +1146,45 @@ class NikobusYamlCoverEntity(CoverEntity, RestoreEntity):
             self._unsubscribe_auto_updater()
             self._unsubscribe_auto_updater = None
 
+    def _connection_is_healthy(self) -> bool:
+        """Return whether the Nikobus transport is currently usable."""
+        connection = getattr(self._coordinator, "nikobus_connection", None)
+        return connection is None or connection.is_connected
+
+    def _abandon_travel_estimate(self) -> None:
+        """Give up on the position estimate after losing the bus mid-travel.
+
+        Freezing the last estimate would be the worse option here: the drive
+        command was already on the bus, so the shutter keeps moving - and the
+        stop command that should have ended the run cannot get through either,
+        so it very likely runs all the way into an end stop. A frozen 40% would
+        then be confidently wrong for as long as nobody looks. Unknown is
+        honest, and unlike a wrong number it can be repaired (see
+        helpers/travelcalculator.TravelCalculator.start_travel).
+        """
+        _LOGGER.warning(
+            "Nikobus connection lost while %s was travelling - position is now "
+            "unknown. Open or close it fully once to re-establish it.",
+            self.entity_id or self._attr_name,
+        )
+        self._tc.mark_position_unknown()
+        self._stop_auto_updater()
+        self._cancel_end_stop_cleanup()
+        self._pending_target = None
+        self._suppress_stop_command = False
+        self._stop_in_progress = False
+        self._state = None
+        self.async_write_ha_state()
+
     @callback
     async def _auto_updater_hook(self, now) -> None:
         if not self._tc:
+            return
+
+        if not self._connection_is_healthy():
+            # The auto updater only runs while this cover is travelling, so
+            # reaching here means the transport died mid-run.
+            self._abandon_travel_estimate()
             return
 
         # Always publish the position, even while a stop command is still waiting
@@ -1090,8 +1260,13 @@ class NikobusYamlCoverEntity(CoverEntity, RestoreEntity):
         except asyncio.CancelledError:
             raise
 
-    def _target_reached(self, position: int) -> bool:
+    def _target_reached(self, position: Optional[int]) -> bool:
         """Report whether the cover has arrived where it should stop."""
+        if position is None:
+            # Unknown position (mid-resync, or just discarded). Nothing can be
+            # compared against a target, and claiming "reached" would stop a
+            # resync run before it ever hit the end stop.
+            return False
         target = self._pending_target
         if target is None:
             return self._tc.position_reached()
@@ -1250,6 +1425,9 @@ class NikobusYamlGroupCoverEntity(CoverEntity):
         self._unsub_button_event = None
         self._last_button_press: Dict[str, float] = {}
         self._group_stop_task: Optional[asyncio.Task] = None
+        # See NikobusYamlCoverEntity for why availability is tracked this way.
+        self._unsub_coordinator = None
+        self._last_available: Optional[bool] = None
         # A button-only group still needs the entity - it carries the listener and
         # the aggregated state - but it does not belong on any dashboard.
         if config.get(CONF_COVER_HIDDEN):
@@ -1270,7 +1448,19 @@ class NikobusYamlGroupCoverEntity(CoverEntity):
         self._attr_is_closing = False
         self._attr_current_cover_position = None
 
+    @property
+    def available(self) -> bool:
+        """Whether this group can actually be driven right now.
+
+        Same reasoning as the single cover: a group whose commands do not reach
+        the bus is not operable, and saying otherwise only hides the outage.
+        The group is unavailable as a whole because the group command is one
+        telegram on one bus - if that bus is gone, no member moves.
+        """
+        return _system_is_available(self._coordinator)
+
     async def async_added_to_hass(self) -> None:
+        self._subscribe_to_availability()
         await async_assign_area_if_missing(
             self.hass, self.entity_id, self._area_name
         )
@@ -1297,12 +1487,32 @@ class NikobusYamlGroupCoverEntity(CoverEntity):
         self._refresh_group_state()
 
     async def async_will_remove_from_hass(self) -> None:
+        if self._unsub_coordinator:
+            self._unsub_coordinator()
+            self._unsub_coordinator = None
         if self._unsub_state:
             self._unsub_state()
             self._unsub_state = None
         if self._unsub_button_event:
             self._unsub_button_event()
             self._unsub_button_event = None
+
+    def _subscribe_to_availability(self) -> None:
+        """Repaint on coordinator updates - see NikobusYamlCoverEntity."""
+        add_listener = getattr(self._coordinator, "async_add_listener", None)
+        if add_listener is None or self._unsub_coordinator is not None:
+            return
+        self._last_available = self.available
+        self._unsub_coordinator = add_listener(self._handle_availability_update)
+
+    @callback
+    def _handle_availability_update(self) -> None:
+        """Write a state only when availability actually flipped."""
+        available = self.available
+        if available == self._last_available:
+            return
+        self._last_available = available
+        self.async_write_ha_state()
 
     async def _handle_bus_button_press(self, event: Any) -> None:
         """Mirror a physical bus button press onto every member of this group.
@@ -1336,6 +1546,7 @@ class NikobusYamlGroupCoverEntity(CoverEntity):
         self._fire_group_event(direction, mirror_only=True)
 
     async def async_open_cover(self, **kwargs: Any) -> None:
+        _require_connection(self._coordinator, self._attr_name)
         _LOGGER.info(
             "Group cover open requested: %s (members=%s)", self._attr_name, self._members
         )
@@ -1348,6 +1559,7 @@ class NikobusYamlGroupCoverEntity(CoverEntity):
             return
 
     async def async_close_cover(self, **kwargs: Any) -> None:
+        _require_connection(self._coordinator, self._attr_name)
         _LOGGER.info(
             "Group cover close requested: %s (members=%s)", self._attr_name, self._members
         )
@@ -1360,6 +1572,7 @@ class NikobusYamlGroupCoverEntity(CoverEntity):
             return
 
     async def async_stop_cover(self, **kwargs: Any) -> None:
+        _require_connection(self._coordinator, self._attr_name)
         _LOGGER.info(
             "Group cover stop requested: %s (members=%s)", self._attr_name, self._members
         )
@@ -1370,6 +1583,7 @@ class NikobusYamlGroupCoverEntity(CoverEntity):
             return
 
     async def async_set_cover_position(self, **kwargs: Any) -> None:
+        _require_connection(self._coordinator, self._attr_name)
         position = kwargs.get(ATTR_POSITION)
         if position is None:
             return
